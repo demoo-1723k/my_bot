@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -713,3 +714,70 @@ def forget_topic(name: str) -> None:
         tmp = _topics_path().with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.replace(_topics_path())
+
+
+# --- outbox: every message the bot sends to the group ----------------------
+# Telegram has no API to list a bot's own messages, so each one is written down
+# as it goes out. /cleanup uses this to delete whatever landed outside the
+# Study Room topic (a topic that was not learned yet, a stale topic id, or a
+# send that had to fall back to General).
+_OUTBOX_MAX = 2000
+
+
+def _outbox_path() -> Path:
+    return DATA_DIR / "outbox.json"
+
+
+def load_outbox() -> list[dict]:
+    """`{"id", "thread", "ts"}` entries, oldest first."""
+    try:
+        raw = json.loads(_outbox_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for entry in raw:
+        if isinstance(entry, dict) and isinstance(entry.get("id"), int):
+            out.append(
+                {
+                    "id": entry["id"],
+                    "thread": entry.get("thread") if isinstance(entry.get("thread"), int) else None,
+                    "ts": entry.get("ts") if isinstance(entry.get("ts"), (int, float)) else None,
+                }
+            )
+    return out
+
+
+def _save_outbox(entries: list[dict]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _outbox_path().with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(entries[-_OUTBOX_MAX:], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(_outbox_path())
+
+
+def record_sent(message_id: int, thread_id: int | None, sent_at: float | None = None) -> None:
+    """Remember one outgoing message (and which topic it landed in)."""
+    message_id = int(message_id)
+    entries = [e for e in load_outbox() if e["id"] != message_id]
+    entries.append(
+        {
+            "id": message_id,
+            "thread": None if thread_id is None else int(thread_id),
+            "ts": time.time() if sent_at is None else float(sent_at),
+        }
+    )
+    _save_outbox(entries)
+
+
+def forget_sent(message_ids) -> None:
+    """Drop entries from the outbox (deleted by us, or already gone)."""
+    drop = {int(i) for i in message_ids}
+    if not drop:
+        return
+    keep = [e for e in load_outbox() if e["id"] not in drop]
+    if len(keep) != len(load_outbox()):
+        _save_outbox(keep)

@@ -28,15 +28,18 @@ re-used as the "screen" and edited as the flow progresses.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
 import os
 import random
 import re
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
+from html import escape
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import PollType
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
@@ -65,11 +68,11 @@ from generator import (
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-QUIZ_CHAT_ID = os.getenv("QUIZ_CHAT_ID", "-1003899214657")
+QUIZ_CHAT_ID = os.getenv("QUIZ_CHAT_ID", "-1002292353150")
 # Forum topic the bot posts into. The topic id can be pinned in .env, or the
 # bot learns it from /topic run inside the topic, or from the service message
 # Telegram sends when the topic is created.
-QUIZ_TOPIC_NAME = os.getenv("QUIZ_TOPIC_NAME", "study room")
+QUIZ_TOPIC_NAME = os.getenv("QUIZ_TOPIC_NAME", "Study Room")
 QUIZ_TOPIC_ID = os.getenv("QUIZ_TOPIC_ID", "")
 
 logging.basicConfig(
@@ -92,6 +95,21 @@ AUTO_QUIZ_COUNT = "auto_quiz_count" # time chosen, waiting for the quantity
 AUTO_NOTE_TIME = "auto_note_time"   # waiting for a typed 24-hour time
 EXAM_NAME = "exam_name"             # exams: waiting for the paper's name
 EXAM_FILES = "exam_files"           # exams: waiting for the PDF(s)
+GEN_DEST = "gen_dest"               # admin in private: group or this chat?
+
+# states only the group owner/admins may hold (a student in a private chat is
+# never in one of these — but if one ever is, it is cleared instead of run)
+ADMIN_STATES = {
+    ADD_NAME,
+    ADD_FILES,
+    DEL_SELECT,
+    DEL_CONFIRM,
+    EXAM_NAME,
+    EXAM_FILES,
+    AUTO_QUIZ_TIME,
+    AUTO_QUIZ_COUNT,
+    AUTO_NOTE_TIME,
+}
 
 # Wake words that turn a normal group message into a question. Students type
 # "baymax what is 2NF" instead of using the /ask command.
@@ -125,13 +143,17 @@ GREETING = (
     "course twice in a row)\n"
     "• Exams — save past papers (with answers); a slice of every quiz then "
     "uses the real questions from them\n\n"
+    "🔒 <b>This menu is for the group owner and admins.</b> Everyone else can "
+    "still talk to me in a private chat: ask a question or get a quiz for "
+    "themselves.\n\n"
     "Ask me anything about your notes: <b>/ask what is a weak entity</b>, or "
     "just say <b>baymax what is 2NF</b> in the group, or reply to one of my "
     "messages. I answer only from your PDFs and show the course · file · "
     "page.\n\n"
     f"Everything is posted in the <b>{QUIZ_TOPIC_NAME}</b> topic. "
     "Every answer shows where the material comes from so you can re-read "
-    "that part. /cancel aborts a step."
+    "that part. /cancel aborts a step, /cleanup removes anything of mine "
+    "that ended up outside the topic."
 )
 
 HELP = (
@@ -156,7 +178,50 @@ HELP = (
     f"<b>{QUIZ_TOPIC_NAME}</b> topic. Quiz questions are fill-in-the-blank "
     "and true/false. After answering, Telegram shows the original sentence "
     "plus its source: course, file and page number.\n\n"
+    "🔒 The menu is for the group owner and admins. In a private chat, press "
+    "Generate Quiz or Generate Note and I ask whether to post it to the "
+    "group or keep it in that chat. Everyone else gets questions and their "
+    "own quiz in a private chat.\n\n"
+    "Everything I post goes in the topic — if something of mine is sitting in "
+    "General or another topic, <b>/cleanup</b> deletes it (admins only, and "
+    "Telegram only allows this for 48 hours). Reply to one of my messages "
+    "with /cleanup to delete just that one, or send <code>/cleanup 1234-1290</code> "
+    "with a range of message ids for older ones. I can only ever delete my "
+    "own messages.\n\n"
     "Note: PDFs need selectable text — scanned images can't be read."
+)
+
+# Shown to anyone who is not the group owner or an admin: they can study, they
+# cannot run the group's bot.
+MEMBER_HINT = (
+    "🔒 Only the group owner and admins can run me here.\n\n"
+    "💬 Open a private chat with me and ask there — I answer your question "
+    "and can send you a quiz of your own."
+)
+
+ADMIN_ONLY_HINT = "🔒 That's for the group owner and admins only."
+
+STUDENT_GREETING = (
+    "👋 Hey! I'm Baymax, the study bot for @practicemakesperfect2.\n\n"
+    "🔎 <b>Ask me anything</b> from the course PDFs — just type your question, "
+    "for example <i>what is a weak entity</i>. I answer with the sentence from "
+    "the material and show its course · file · page.\n\n"
+    "🎯 <b>Send me a quiz</b> — a mixed quiz posted right here in this chat, "
+    "with as many questions as you want.\n\n"
+    "The group owner and admins manage the courses, exams and schedules; "
+    "whatever you ask stays in this chat."
+)
+
+STUDENT_HELP = (
+    "How to study with me:\n"
+    "• Just type your question here — e.g. what is a weak entity\n"
+    "• /ask &lt;question&gt; works the same way\n"
+    "• Press 🎯 Send me a quiz for a quiz of your own\n\n"
+    "I only answer from the PDFs the admins have saved, and I always show "
+    "where the answer came from. If it isn't in the material, I say so "
+    "instead of guessing.\n\n"
+    "In the group only the owner and admins can use the bot, so this chat is "
+    "your place to ask."
 )
 
 
@@ -180,6 +245,34 @@ def _menu_kb() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("📚 Exams", callback_data="menu:exams"),
             ],
+        ]
+    )
+
+
+def _student_kb() -> InlineKeyboardMarkup:
+    """What someone who is not an admin is allowed to do."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🎯 Send me a quiz", callback_data="menu:squiz")],
+            [InlineKeyboardButton("🔎 How to ask", callback_data="menu:how")],
+        ]
+    )
+
+
+def _menu_screen(is_admin: bool) -> tuple[str, InlineKeyboardMarkup]:
+    """The /start screen for whoever pressed it."""
+    if is_admin:
+        return GREETING, _menu_kb()
+    return STUDENT_GREETING, _student_kb()
+
+
+def _dest_kb() -> InlineKeyboardMarkup:
+    """Where should this quiz/note go — the group, or this private chat?"""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📌 To the group", callback_data="dest:group")],
+            [InlineKeyboardButton("💬 Here in this chat", callback_data="dest:private")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="menu:back")],
         ]
     )
 
@@ -300,7 +393,175 @@ def _exams_screen() -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), _exams_kb()
 
 
+# --- one bot instance only ------------------------------------------------
+# Telegram hands a bot's updates to a single getUpdates poller. A second copy
+# of this script does not fail cleanly: it fills the log with
+# "Conflict: terminated by other getUpdates request", and the two copies fight
+# over the same updates (the console you are watching may be the one that is
+# losing). A lock file makes the second copy say so in one line instead.
+LOCK_FILE = "bot.lock"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is a process with this id still running?"""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # it exists, just owned by another user
+    except OSError:
+        return False
+    return True
+
+
+def _lock_path() -> Path:
+    return storage.DATA_DIR / LOCK_FILE
+
+
+def _acquire_single_instance_lock() -> Path | None:
+    """Claim the right to run. None means another copy is already running.
+
+    A lock left behind by a copy that crashed (its process is gone) is taken
+    over instead of blocking the next start.
+    """
+    path = _lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        owner = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        owner = 0
+    if owner and owner != os.getpid() and _pid_alive(owner):
+        return None
+    path.write_text(str(os.getpid()), encoding="utf-8")
+    return path
+
+
+def _release_single_instance_lock(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        if path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            path.unlink()
+    except OSError:
+        pass  # a leftover lock is harmless: it is overwritten next start
+
+
 # --- helpers --------------------------------------------------------------
+
+# Who may control the bot. Telegram reports the group's owner as "creator" and
+# its admins as "administrator"; everyone else is a plain member. The answer
+# is cached briefly so a burst of messages does not become an API call each.
+_MEMBER_CACHE: dict[int, tuple[float, str]] = {}
+_MEMBER_CACHE_TTL = 60.0
+
+
+def _clear_member_cache() -> None:
+    _MEMBER_CACHE.clear()
+
+
+def _chat_type(update: Update) -> str | None:
+    """"group" / "private" / ... — None when the update carries no chat."""
+    return getattr(getattr(update, "effective_chat", None), "type", None)
+
+
+def _is_private(update: Update) -> bool:
+    """True only for a chat we can see is private (no chat = not private)."""
+    return _chat_type(update) == "private"
+
+
+def _chat_id(update: Update) -> int | None:
+    return getattr(getattr(update, "effective_chat", None), "id", None)
+
+
+def _message_is_private(message) -> bool:
+    """True when a Message object is a private chat with the bot."""
+    return getattr(getattr(message, "chat", None), "type", None) == "private"
+
+
+def _group_chat_id():
+    """QUIZ_CHAT_ID as a number when it is one, else as the @username."""
+    try:
+        return int(str(QUIZ_CHAT_ID).strip())
+    except (TypeError, ValueError):
+        return QUIZ_CHAT_ID
+
+
+async def _member_status(update: Update, context) -> str | None:
+    """The user's status in the study group, or None when it is unknown.
+
+    "none" means Telegram says they are not in the group at all. None means we
+    could not find out — no chat attached, an API/network failure, or a test
+    double — and the caller then does not block anyone, so a flaky connection
+    can never lock the owner out of their own bot.
+    """
+    uid = getattr(getattr(update, "effective_user", None), "id", None)
+    if uid is None:
+        return None
+    now = time.monotonic()
+    cached = _MEMBER_CACHE.get(uid)
+    if cached is not None and now - cached[0] < _MEMBER_CACHE_TTL:
+        return cached[1]
+
+    is_private = _is_private(update)
+    try:
+        if is_private:
+            # in a private chat, ask the group directly
+            getter = getattr(getattr(context, "bot", None), "get_chat_member", None)
+            if getter is None:
+                return None
+            member = await getter(_group_chat_id(), uid)
+        else:
+            getter = getattr(getattr(update, "effective_chat", None), "get_member", None)
+            if getter is None:
+                return None
+            member = await getter(uid)
+    except NetworkError:
+        return None  # transient — do not cache, try again next time
+    except TelegramError as exc:
+        status = "none"  # not in the group (or the bot cannot see it)
+        logger.info(
+            "membership check for %s: %s (they get the student view)", uid, exc
+        )
+    except Exception:
+        return None  # not a Telegram object at all (tests)
+    else:
+        status = getattr(member, "status", None) or "none"
+    _MEMBER_CACHE[uid] = (time.monotonic(), status)
+    return status
+
+
+async def _is_admin(update: Update, context) -> bool:
+    """May this user run the bot: the group's owner or one of its admins?
+
+    Checked in the group and in a private chat alike, so an admin gets the full
+    menu in both. An unknown answer is treated as "yes" — the failure mode of
+    failing open is a student seeing a menu, the failure mode of failing closed
+    is the owner being locked out.
+    """
+    status = await _member_status(update, context)
+    if status is None:
+        return True
+    return status in ("creator", "administrator")
+
 
 def _thread_id() -> int | None:
     """The forum topic id the bot posts into, or None to use General.
@@ -352,34 +613,127 @@ def _forget_stale_topic() -> None:
     )
 
 
-async def _send_to_topic(bot, text: str, **kwargs) -> bool:
-    """Post a message into the study-room topic (or General if unknown).
+def _record_sent(message) -> None:
+    """Write down an outgoing group message so /cleanup can remove it later.
+
+    Telegram has no API for "list my own messages", so every send to the group
+    is remembered with the topic it landed in. Private chats are not recorded:
+    they are already where they belong.
+    """
+    if message is None:
+        return
+    if str(getattr(message, "chat_id", "")) != str(QUIZ_CHAT_ID):
+        return
+    try:
+        storage.record_sent(
+            int(message.message_id), getattr(message, "message_thread_id", None)
+        )
+    except Exception:  # never let bookkeeping break a send
+        logger.debug("could not record sent message", exc_info=True)
+
+
+def _is_outside_topic(message) -> bool:
+    """True when this message came from the group but not from the topic.
+
+    Everything the bot does belongs in the Study Room, so a command, question
+    or button pressed in General (or in another topic) is answered *inside* the
+    topic rather than where it came from. Private chats are never redirected.
+    """
+    if str(getattr(message, "chat_id", "")) != str(QUIZ_CHAT_ID):
+        return False
+    tid = _thread_id()
+    if tid is None:
+        return False  # topic unknown — there is nowhere to redirect to
+    return getattr(message, "message_thread_id", None) != tid
+
+
+def _bot_of(message):
+    """The Bot bound to a Message, or None (test doubles have no bot)."""
+    getter = getattr(message, "get_bot", None)
+    if getter is None:
+        return None
+    try:
+        return getter()
+    except Exception:
+        return None
+
+
+def _ref_in_topic(ref) -> bool:
+    """May a remembered screen still be edited in place?
+
+    A screen outside the Study Room is retired when the flow moves into the
+    topic, so editing it afterwards would rewrite the "Moved to the Study Room
+    topic" notice instead of showing progress — in that case the update is sent
+    as a fresh message (which `_reply` puts in the topic). Private chats have
+    no topic and are always fine.
+    """
+    if not ref or len(ref) < 3:
+        return True  # no thread recorded — keep the straightforward behaviour
+    chat_id, _message_id, thread = ref
+    if str(chat_id) != str(QUIZ_CHAT_ID):
+        return True  # a private chat, not a topic
+    return thread == _thread_id()
+
+
+def _screen_ref(message) -> tuple:
+    """Remember a screen message together with the topic it lives in."""
+    return (
+        message.chat_id,
+        message.message_id,
+        getattr(message, "message_thread_id", None),
+    )
+
+
+async def _send_to_topic(bot, text: str, **kwargs):
+    """Post a message into the study-room topic; returns the sent Message.
 
     A topic id Telegram no longer recognises is forgotten and the send is
-    retried in General, so one deleted topic cannot silence the bot.
+    retried in General, so one deleted topic cannot silence the bot. None means
+    the message could not be posted at all.
     """
     try:
-        return bot.send_message(
+        sent = await bot.send_message(
             chat_id=QUIZ_CHAT_ID, text=text, **_thread_kwargs(**kwargs)
-        ) is not None
+        )
     except BadRequest as exc:
         if not _is_missing_thread(exc):
             logger.warning("could not post to the topic: %s", exc)
-            return False
+            return None
         _forget_stale_topic()
         try:
-            return bot.send_message(chat_id=QUIZ_CHAT_ID, text=text, **kwargs) is not None
+            sent = await bot.send_message(chat_id=QUIZ_CHAT_ID, text=text, **kwargs)
         except (BadRequest, NetworkError, TimedOut, TelegramError) as retry_exc:
             logger.warning("could not post to General either: %s", retry_exc)
-            return False
+            return None
     except (NetworkError, TimedOut, TelegramError) as exc:
         logger.warning("could not post to the topic: %s", exc)
-        return False
+        return None
+    _record_sent(sent)
+    return sent
 
 
 def _clear_state(context: ContextTypes.DEFAULT_TYPE) -> None:
-    for key in ("state", "course_id", "del_id", "gen_msg", "pending_time", "aq_msg"):
+    for key in (
+        "state",
+        "course_id",
+        "del_id",
+        "gen_msg",
+        "pending_time",
+        "aq_msg",
+        "dest_flow",
+        "dest_chat",
+    ):
         context.user_data.pop(key, None)
+
+
+# What a non-admin may press — their own quiz and the help screen. Everything
+# else changes the group's material or schedules and belongs to the owner and
+# admins.
+_STUDENT_CALLBACKS = ("menu:squiz", "menu:how", "menu:back", "menu:cancel")
+
+
+def _student_can(data: str) -> bool:
+    return data in _STUDENT_CALLBACKS or data.startswith("gen:")
 
 
 # --- Schedule helpers -----------------------------------------------------
@@ -499,7 +853,20 @@ async def _safe_answer(query, text: str = "", show_alert: bool = False) -> None:
 
 
 async def _reply(message, text: str, **kwargs):
-    """Reply with one retry so a transient timeout doesn't drop the message."""
+    """Reply to a message — from the group, always inside the Study Room.
+
+    A question asked in General (or another topic) is answered in the topic, so
+    everything the bot produces lives in one place; elsewhere the reply simply
+    stays where it was asked. One retry so a transient timeout doesn't drop it.
+    """
+    if _is_outside_topic(message):
+        bot = _bot_of(message)
+        if bot is not None:
+            sent = await _send_to_topic(bot, text, **kwargs)
+            if sent is not None:
+                return sent
+            # the topic refused the message: fall through and answer in place
+            # so the flow the user started still has something on screen
     for attempt in (1, 2):
         try:
             return await message.reply_text(text, **kwargs)
@@ -546,7 +913,12 @@ async def _edit_text_safe(
 
 async def _edit(query, text: str, kb: InlineKeyboardMarkup | None = None, **kwargs) -> None:
     """Edit the message a button was pressed on; retry once, then fall back
-    to sending a fresh message so the user still sees the outcome."""
+    to sending a fresh message so the user still sees the outcome.
+
+    A screen that lives outside the Study Room topic is not edited in place —
+    the new screen goes into the topic and the old one is retired, so no flow
+    keeps running in General.
+    """
     msg = query.message
     if msg is None:  # very old message — best effort
         try:
@@ -554,6 +926,15 @@ async def _edit(query, text: str, kb: InlineKeyboardMarkup | None = None, **kwar
         except TelegramError as exc:
             logger.warning("edit_message_text failed: %s", exc)
         return
+    if _is_outside_topic(msg):
+        bot = _bot_of(msg)
+        if bot is None:
+            bot = query.get_bot()
+        sent = await _send_to_topic(bot, text, reply_markup=kb, **kwargs)
+        if sent is not None:
+            await _retire(msg)
+            return
+        # could not reach the topic: edit the old screen so the flow continues
     if await _edit_text_safe(query.get_bot(), msg.chat_id, msg.message_id, text, kb, **kwargs):
         return
     try:
@@ -562,23 +943,41 @@ async def _edit(query, text: str, kb: InlineKeyboardMarkup | None = None, **kwar
         logger.warning("fallback reply failed: %s", exc)
 
 
-async def _send_message_safe(bot, text: str, attempts: int = 3, **kwargs) -> bool:
-    """Send one message to the group topic, retrying transient network errors.
+async def _retire(message) -> None:
+    """Blank a screen left outside the topic so nobody keeps pressing it."""
+    try:
+        await message.edit_text("➡️ Moved to the Study Room topic.", reply_markup=None)
+    except TelegramError as exc:
+        logger.info("could not retire an old screen: %s", exc)
 
-    Used by the daily jobs, which have no chat UI to fall back to. A topic id
-    Telegram no longer knows is dropped and the send retried in General.
+
+async def _send_message_safe(
+    bot, text: str, attempts: int = 3, chat_id=None, **kwargs
+) -> bool:
+    """Send one message, retrying transient network errors.
+
+    Used by the daily jobs, which have no chat UI to fall back to. `chat_id`
+    defaults to the group topic; pass a private chat id to send it to one
+    person instead. A topic id Telegram no longer knows is dropped and the
+    send retried in General.
     """
+    target = QUIZ_CHAT_ID if chat_id is None else chat_id
+    in_group = str(target) == str(QUIZ_CHAT_ID)
     for attempt in range(attempts):
         try:
-            await bot.send_message(
-                chat_id=QUIZ_CHAT_ID, text=text, **_thread_kwargs(**kwargs)
+            sent = await bot.send_message(
+                chat_id=target,
+                text=text,
+                **(_thread_kwargs(**kwargs) if in_group else kwargs),
             )
+            _record_sent(sent)
             return True
         except BadRequest as exc:
-            if _is_missing_thread(exc):
+            if in_group and _is_missing_thread(exc):
                 _forget_stale_topic()
                 try:
-                    await bot.send_message(chat_id=QUIZ_CHAT_ID, text=text, **kwargs)
+                    sent = await bot.send_message(chat_id=target, text=text, **kwargs)
+                    _record_sent(sent)
                     return True
                 except (BadRequest, TimedOut, NetworkError) as retry_exc:
                     logger.error("Message rejected even in General: %s", retry_exc)
@@ -597,7 +996,8 @@ async def _send_poll_with_retry(bot, kwargs: dict, attempts: int = 4, backoff: f
     """Send one poll, retrying timeouts and honouring flood limits (RetryAfter)."""
     for attempt in range(attempts):
         try:
-            await bot.send_poll(**kwargs)
+            sent = await bot.send_poll(**kwargs)
+            _record_sent(sent)
             return True
         except RetryAfter as exc:
             wait = exc.retry_after
@@ -610,9 +1010,10 @@ async def _send_poll_with_retry(bot, kwargs: dict, attempts: int = 4, backoff: f
                 # the topic is gone; post this quiz in General and move on
                 _forget_stale_topic()
                 try:
-                    await bot.send_poll(
+                    sent = await bot.send_poll(
                         **{k: v for k, v in kwargs.items() if k != "message_thread_id"}
                     )
+                    _record_sent(sent)
                     return True
                 except (BadRequest, TimedOut, NetworkError) as retry_exc:
                     logger.error(
@@ -635,18 +1036,35 @@ async def _send_poll_with_retry(bot, kwargs: dict, attempts: int = 4, backoff: f
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _clear_state(context)
-    await _reply(update.effective_message, GREETING, reply_markup=_menu_kb())
+    admin = await _is_admin(update, context)
+    if not admin and not _is_private(update):
+        # the group belongs to the owner and admins; members get pointed at a
+        # private chat instead of being handed the menu
+        await _reply(update.effective_message, MEMBER_HINT)
+        return
+    text, kb = _menu_screen(admin)
+    await _reply(update.effective_message, text, reply_markup=kb, parse_mode="HTML")
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _reply(update.effective_message, HELP, reply_markup=_menu_kb())
+    admin = await _is_admin(update, context)
+    if not admin and not _is_private(update):
+        await _reply(update.effective_message, MEMBER_HINT)
+        return
+    text, kb = (HELP, _menu_kb()) if admin else (STUDENT_HELP, _student_kb())
+    await _reply(update.effective_message, text, reply_markup=kb, parse_mode="HTML")
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     had_state = bool(context.user_data.get("state"))
     _clear_state(context)
     text = "✋ Cancelled." if had_state else "Nothing to cancel."
-    await _reply(update.effective_message, text, reply_markup=_menu_kb())
+    admin = await _is_admin(update, context)
+    if not admin and not _is_private(update):
+        await _reply(update.effective_message, text)
+        return
+    _, kb = _menu_screen(admin)
+    await _reply(update.effective_message, text, reply_markup=kb)
 
 
 # --- Ask (Q&A over your own notes) ----------------------------------------
@@ -707,38 +1125,52 @@ def _answer(query: str) -> Answer | None:
 
 async def _ask(query: str, message) -> None:
     """Reply to a study question using only the saved PDFs."""
+    # When the answer has to travel into the Study Room topic (the question
+    # was asked in General or another topic) the question rides along with it,
+    # otherwise nobody in the topic would know what is being answered.
+    prefix = f"❓ <i>{escape(query)}</i>\n\n" if _is_outside_topic(message) else ""
+
+    async def say(text: str, **extra):
+        if prefix:
+            extra.setdefault("parse_mode", "HTML")
+        return await _reply(message, prefix + text, **extra)
+
     if not query.strip():
         await _reply(
             message,
             "🔎 Ask me a question about your notes, e.g. "
             "<i>/ask what is a weak entity</i>",
+            parse_mode="HTML",
         )
         return
     # Building the BM25 indexes takes a moment, and this handler runs on the
     # event loop that also has to deliver every other update, so both the
     # indexing and the search go to a worker thread.
     if not await asyncio.to_thread(_ask_indexes):
-        await _reply(
-            message,
+        await say(
             "📭 I have no readable material yet. Add a course with PDFs "
-            "first (/start → Add Course), then ask again.",
+            "first (/start → Add Course), then ask again."
         )
         return
 
     answer = await asyncio.to_thread(_answer, query)
     if answer is None:
-        await _reply(
-            message,
+        await say(
             "🤷 I couldn't find that in your notes. I only answer from the "
             "PDFs you've added — try the exact wording the slides use, or "
-            "check the course is saved.",
+            "check the course is saved."
         )
         return
-    await _reply(message, answer.render(), parse_mode="HTML")
+    # in a private chat, offer the next step right under the answer
+    markup = _student_kb() if _message_is_private(message) else None
+    await say(answer.render(), parse_mode="HTML", reply_markup=markup)
 
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/ask <question>` — answered straight from the saved material."""
+    if not await _is_admin(update, context) and not _is_private(update):
+        await _reply(update.effective_message, MEMBER_HINT)
+        return
     query = " ".join(context.args or []).strip()
     if not query:
         query = (update.effective_message.text or "").removeprefix("/ask").strip()
@@ -754,22 +1186,272 @@ async def cmd_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from.
     """
     message = update.effective_message
+    if not await _is_admin(update, context):
+        await _reply(message, ADMIN_ONLY_HINT)
+        return
     thread = getattr(message, "message_thread_id", None)
     if thread is None:
+        current = _thread_id()
         await _reply(
             message,
             f"Send /topic from inside the <b>{QUIZ_TOPIC_NAME}</b> topic so I "
             "can learn its id.\n\n"
-            f"Or put <code>QUIZ_TOPIC_ID=&lt;id&gt;</code> in .env. "
-            f"Currently: {'not set' if _thread_id() is None else _thread_id()}",
+            + (
+                f"Right now I'm posting to id <code>{current}</code> — send "
+                "/topic from the right topic to change it."
+                if current is not None
+                else f"Or put <code>QUIZ_TOPIC_ID=&lt;id&gt;</code> in .env."
+            ),
+            parse_mode="HTML",
         )
         return
     storage.save_topic(QUIZ_TOPIC_NAME, int(thread))
     await _reply(
         message,
-        f"✅ Noted — I'll post quizzes, notes and answers in "
+        f"✅ Noted — everything I post (quizzes, notes and answers) goes in "
         f"<b>{QUIZ_TOPIC_NAME}</b> from now on.",
+        parse_mode="HTML",
     )
+
+
+async def _delete_group_message(bot, message_id: int) -> tuple[str, str]:
+    """Delete one of the bot's own messages from the group.
+
+    Returns (result, reason): "ok" (deleted), "gone" (not there, not ours, or
+    older than Telegram's 48-hour window), "retry" (network/flood — worth
+    another run) or "fail" (refused for some other reason). `reason` carries
+    Telegram's own words so the user can be told what actually happened.
+    """
+    for attempt in (1, 2):
+        try:
+            await bot.delete_message(_group_chat_id(), message_id)
+            return "ok", ""
+        except RetryAfter as exc:
+            wait = exc.retry_after
+            if not isinstance(wait, int):
+                wait = max(1, int(wait.total_seconds()))
+            if attempt == 1:
+                await asyncio.sleep(wait + 0.5)
+                continue
+            return "retry", str(exc)
+        except BadRequest as exc:
+            reason = str(exc)
+            if any(
+                needle in reason.lower()
+                for needle in ("not found", "48 hours", "too old", "can't be deleted", "cannot be deleted")
+            ):
+                return "gone", reason
+            return "fail", reason
+        except (NetworkError, TimedOut, TelegramError) as exc:
+            return "retry", str(exc)
+    return "retry", ""
+
+
+# A bounded sweep, e.g. "/cleanup 1234-1290" or "/cleanup from 1234 to 1290".
+_SWEEP_MAX = 300
+_SWEEP_RE = re.compile(
+    r"^(?:from\s+)?(\d+)\s*(?:-|\.\.|to|until|and)\s*(\d+)$",
+    re.IGNORECASE,
+)
+
+
+async def _may_delete_others(bot) -> bool:
+    """Could this bot delete a message it did not send?
+
+    Telegram always lets a bot delete its own messages, but deleting anybody
+    else's needs more: the admin right in a supergroup, or plain being an
+    administrator of a basic group. A sweep only ever means "my own messages",
+    so when the bot could do more than that it is not used. Unknown counts as
+    "could" — the reply form still works.
+    """
+    try:
+        chat = await bot.get_chat(_group_chat_id())
+        me = await bot.get_me()
+        member = await bot.get_chat_member(_group_chat_id(), me.id)
+    except Exception as exc:  # no/unreachable API: assume the worse
+        logger.info("could not check the bot's own rights: %s", exc)
+        return True
+    if getattr(member, "status", "") not in ("administrator", "creator"):
+        return False
+    if getattr(chat, "type", "") == "group":
+        return True
+    return bool(getattr(member, "can_delete_messages", False))
+
+
+async def _sweep_range(bot, low: int, high: int) -> tuple[int, int, list[str]]:
+    """Delete the bot's own messages between two message ids.
+
+    Telegram refuses to delete anything the bot did not send, so a sweep can
+    only ever remove the bot's own messages — never anybody else's. Ids the
+    bot knows it posted inside the Study Room are skipped, so the current
+    quizzes and notes are protected.
+    """
+    tid = _thread_id()
+    protected = {e["id"] for e in storage.load_outbox() if e.get("thread") == tid}
+    deleted = skipped = 0
+    problems: list[str] = []
+    for message_id in range(low, high + 1):
+        if message_id in protected:
+            skipped += 1
+            continue
+        result, reason = await _delete_group_message(bot, message_id)
+        if result == "ok":
+            deleted += 1
+        else:
+            skipped += 1
+            if reason and result != "gone" and reason not in problems:
+                problems.append(reason)
+        await asyncio.sleep(0.05)  # stay under Telegram's per-chat rate limit
+    return deleted, skipped, problems
+
+
+async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/cleanup` — remove the bot's messages from outside the Study Room.
+
+    Three ways to use it:
+      * `/cleanup` — clears the messages the bot remembers sending outside the
+        topic (storage.record_sent logs every group send with its topic);
+      * `/cleanup 1234-1290` — sweeps a range of message ids, the only way to
+        reach messages sent before that log existed;
+      * replied to one of the bot's messages — deletes just that message.
+
+    Telegram refuses to delete anything the bot did not send, so none of these
+    can ever remove somebody else's message.
+    """
+    message = update.effective_message
+    if not await _is_admin(update, context):
+        await _reply(message, ADMIN_ONLY_HINT)
+        return
+
+    # /cleanup as a reply deletes exactly the message being replied to. When
+    # the writer is known and it is not the bot, refuse outright — a bot with
+    # the admin right could otherwise delete a student's message. When it
+    # cannot be told, try anyway: Telegram refuses anything the bot did not
+    # send, and its own words are shown if it does.
+    replied = getattr(message, "reply_to_message", None)
+    if replied is not None:
+        replied_from = getattr(getattr(replied, "from_user", None), "id", None)
+        bot_user_id = _bot_id(update)
+        if (
+            replied_from is not None
+            and bot_user_id is not None
+            and replied_from != bot_user_id
+        ):
+            await _reply(message, "That message isn't mine — I only delete my own.")
+            return
+        try:
+            await context.bot.delete_message(replied.chat_id, replied.message_id)
+        except TelegramError as exc:
+            await _reply(
+                message,
+                f"😕 Telegram would not delete that message:\n<i>{escape(str(exc))}</i>\n\n"
+                "That is what Telegram says when the message is not mine, is "
+                "older than 48 hours, or I am not allowed to delete it there.",
+                parse_mode="HTML",
+            )
+            return
+        storage.forget_sent([replied.message_id])
+        await _reply(message, "🗑 Deleted that message.")
+        return
+
+    # /cleanup 1234-1290 sweeps an id range — the only way to reach messages
+    # sent before I started keeping track of them.
+    args = " ".join(context.args or []).strip()
+    if args:
+        match = _SWEEP_RE.match(args)
+        if not match:
+            await _reply(
+                message,
+                "Usage: <code>/cleanup 1234-1290</code>\n"
+                "Open any message in web.telegram.org — the number at the end "
+                "of the link is its id.",
+                parse_mode="HTML",
+            )
+            return
+        low, high = sorted((int(match.group(1)), int(match.group(2))))
+        if high - low + 1 > _SWEEP_MAX:
+            await _reply(
+                message,
+                f"That's {high - low + 1} messages — sweep at most "
+                f"{_SWEEP_MAX} at a time.",
+            )
+            return
+        if await _may_delete_others(context.bot):
+            await _reply(
+                message,
+                "⚠️ A sweep would be able to remove other people's messages "
+                "too, so I won't run one here — a sweep must mean my own "
+                "messages only.\n\n"
+                "Reply to each of my messages and send /cleanup, and I'll "
+                "delete it one by one.",
+            )
+            return
+        await _reply(message, f"🔍 Checking messages {low}–{high}…")
+        deleted, skipped, problems = await _sweep_range(context.bot, low, high)
+        lines = [
+            f"🗑 Deleted {deleted} of my messages in {low}–{high}."
+            + (f" ({skipped} ids weren't mine, or are in the topic.)" if skipped else "")
+        ]
+        for problem in problems[:3]:
+            lines.append(f"⚠️ {problem[:200]}")
+        await _reply(message, "\n".join(lines))
+        return
+
+    tid = _thread_id()
+    if tid is None:
+        await _reply(
+            message,
+            f"I don't know the {QUIZ_TOPIC_NAME} topic yet, so I can't tell "
+            "which of my messages are outside it. Send /topic inside the "
+            "topic, then run /cleanup again.",
+        )
+        return
+
+    outside = [e for e in storage.load_outbox() if e.get("thread") != tid]
+    if not outside:
+        await _reply(
+            message,
+            f"✅ Nothing I remember is outside the {QUIZ_TOPIC_NAME} topic.\n\n"
+            "Older messages I sent before I started keeping track can still go:\n"
+            "• reply to one of them and send /cleanup again, or\n"
+            "• send <code>/cleanup 1234-1290</code> with the id range "
+            "(web.telegram.org shows the id at the end of a message's link).",
+            parse_mode="HTML",
+        )
+        return
+
+    deleted = gone = retry = 0
+    finished: list[int] = []
+    for entry in outside:
+        result, _reason = await _delete_group_message(context.bot, entry["id"])
+        if result == "ok":
+            deleted += 1
+            finished.append(entry["id"])
+        elif result == "gone":
+            gone += 1
+            finished.append(entry["id"])
+        else:
+            retry += 1
+            continue
+        await asyncio.sleep(0.06)  # stay under Telegram's per-chat rate limit
+    storage.forget_sent(finished)
+
+    lines = []
+    if deleted:
+        lines.append(
+            f"🗑 Deleted {deleted} message{'s' if deleted != 1 else ''} from "
+            f"outside the {QUIZ_TOPIC_NAME} topic."
+        )
+    if gone:
+        lines.append(
+            f"ℹ️ {gone} more were already gone or older than Telegram's "
+            "48-hour limit."
+        )
+    if retry:
+        lines.append(f"⚠️ {retry} could not be deleted right now — run /cleanup again shortly.")
+    if not lines:
+        lines.append(f"✅ Nothing to clean up outside {QUIZ_TOPIC_NAME}.")
+    await _reply(message, "\n".join(lines))
 
 
 # --- Add Course flow ------------------------------------------------------
@@ -847,9 +1529,9 @@ async def _finish_exam(query, context: ContextTypes.DEFAULT_TYPE, *, fallback=No
         "Its questions will now show up in your quizzes.\n\n" + text
     )
     if query is not None:
-        await _edit(query, message, kb)
+        await _edit(query, message, kb, parse_mode="HTML")
     elif fallback is not None:
-        await _reply(fallback, message, reply_markup=kb)
+        await _reply(fallback, message, reply_markup=kb, parse_mode="HTML")
 
 
 # --- Generate Quiz --------------------------------------------------------
@@ -927,12 +1609,18 @@ def _build_quiz(count: int, seed: int | None = None):
     return questions
 
 
-async def _post_questions(bot, questions) -> int:
-    """Post quiz polls to the group topic; returns how many made it through."""
+async def _post_questions(bot, questions, chat_id=None) -> int:
+    """Post quiz polls; returns how many made it through.
+
+    `chat_id` is None for the group topic, or a private chat id when the quiz
+    was requested for one person.
+    """
+    target = QUIZ_CHAT_ID if chat_id is None else chat_id
+    in_group = str(target) == str(QUIZ_CHAT_ID)
     sent = 0
     for q in questions:
         kwargs: dict = {
-            "chat_id": QUIZ_CHAT_ID,
+            "chat_id": target,
             "question": q.text,
             "options": q.options,
             "type": PollType.QUIZ,
@@ -941,7 +1629,9 @@ async def _post_questions(bot, questions) -> int:
         }
         if q.explanation:
             kwargs["explanation"] = q.explanation
-        if await _send_poll_with_retry(bot, _thread_kwargs(**kwargs)):
+        if in_group:
+            kwargs = _thread_kwargs(**kwargs)
+        if await _send_poll_with_retry(bot, kwargs):
             sent += 1
         await asyncio.sleep(0.4)  # stay under Telegram's per-chat rate limit
     return sent
@@ -955,27 +1645,38 @@ async def _run_quiz(
     edit_query=None,
     msg_ref: tuple | None = None,
     fallback=None,
+    dest_chat: int | None = None,
 ) -> None:
-    """Build the mixed quiz and post it to the group.
+    """Build the mixed quiz and post it.
 
     Progress/result text is shown by editing the pressed button's message
     (`edit_query`) or the stored prompt message (`msg_ref` — used when the
     quantity was typed), falling back to a fresh reply when edits fail.
+
+    `dest_chat` decides where the polls go: None is the group topic, an int is
+    one private chat (an admin who asked for a quiz here, or a student).
     """
+    admin = await _is_admin(update, context)
+    screen_kb = _menu_screen(admin)[1]
+    if not admin:
+        # a student never gets the quiz posted in the group
+        dest_chat = _chat_id(update)
+    in_group = dest_chat is None
+    where = GROUP_LABEL if in_group else "this chat"
 
     async def show(text: str, kb: InlineKeyboardMarkup | None = None) -> None:
         if edit_query is not None:
             await _edit(edit_query, text, kb)
             return
-        if msg_ref is not None:
-            chat_id, message_id = msg_ref
+        if msg_ref is not None and _ref_in_topic(msg_ref):
+            chat_id, message_id = msg_ref[:2]
             if await _edit_text_safe(context.bot, chat_id, message_id, text, kb):
                 return
         if fallback is not None:
             await _reply(fallback, text, reply_markup=kb)
 
     courses = storage.list_courses()
-    if not courses:
+    if not courses and not storage.list_exams():
         if edit_query is not None:
             await _safe_answer(edit_query, "Add a course first!", show_alert=True)
         elif fallback is not None:
@@ -988,39 +1689,46 @@ async def _run_quiz(
     )
 
     sources = _build_sources()
-    if not sources:
+    if not sources and not _build_exam_sources():
         await show(
             "😕 No readable text found in any course. Re-add the PDFs "
             "(they need selectable text).",
-            _menu_kb(),
+            screen_kb,
         )
         return
 
     try:
         questions = await asyncio.to_thread(_build_quiz, count, None)
     except InsufficientTextError as exc:
-        await show(f"😕 {exc}", _menu_kb())
+        await show(f"😕 {exc}", screen_kb)
         return
 
-    sent = await _post_questions(context.bot, questions)
+    sent = await _post_questions(context.bot, questions, chat_id=dest_chat)
 
-    names = ", ".join(c.name for c in courses)
+    names = ", ".join(c.name for c in courses) or "your saved exams"
     if sent:
         exam_qs = sum(1 for q in questions if q.subtype == "exam")
         lines = [
             f"✅ Sent {sent}/{len(questions)} mixed questions from "
-            f"{names} to {GROUP_LABEL} 🎯"
+            f"{names} to {where} 🎯"
         ]
         if exam_qs:
             lines.append(f"📚 {exam_qs} from your saved exams")
-        await show("\n".join(lines), _menu_kb())
+        await show("\n".join(lines), screen_kb)
     else:
-        await show(
-            f"❌ Couldn't post to {GROUP_LABEL}. Check QUIZ_CHAT_ID in .env, "
-            "that the bot is still an admin, and that the "
-            f"'{QUIZ_TOPIC_NAME}' topic exists (send /topic inside it).",
-            _menu_kb(),
-        )
+        if in_group:
+            await show(
+                f"❌ Couldn't post to {GROUP_LABEL}. Check QUIZ_CHAT_ID in .env, "
+                "that the bot is still an admin, and that the "
+                f"'{QUIZ_TOPIC_NAME}' topic exists (send /topic inside it).",
+                screen_kb,
+            )
+        else:
+            await show(
+                "❌ Couldn't send the quiz to this chat — press /start and "
+                "try again.",
+                screen_kb,
+            )
 
 
 # --- Generate Note --------------------------------------------------------
@@ -1047,12 +1755,17 @@ def _pick_note(exclude_course_id: int | None = None) -> tuple[storage.Course | N
     return None, None
 
 
-async def _run_note(context: ContextTypes.DEFAULT_TYPE, *, edit_query) -> None:
-    """Post one note from a random course to the group (manual test).
+async def _run_note(
+    context: ContextTypes.DEFAULT_TYPE, *, edit_query, dest_chat: int | None = None
+) -> None:
+    """Post one note from a random course (manual test).
 
-    The note itself goes to the group, exactly like the daily one — the button
+    The note itself goes to the group topic — or to `dest_chat` when an admin
+    asked for it in a private chat — exactly like the daily one; the button
     message just confirms what was sent and where.
     """
+    in_group = dest_chat is None
+    where = GROUP_LABEL if in_group else "this chat"
     if not storage.list_courses():
         await _safe_answer(edit_query, "Add a course first!", show_alert=True)
         return
@@ -1067,19 +1780,29 @@ async def _run_note(context: ContextTypes.DEFAULT_TYPE, *, edit_query) -> None:
             _menu_kb(),
         )
         return
-    if not await _send_message_safe(context.bot, note.render("Note"), parse_mode="HTML"):
-        await _edit(
-            edit_query,
-            f"❌ Couldn't post to {GROUP_LABEL}. Check QUIZ_CHAT_ID in .env, "
-            "that the bot is still an admin, and that the "
-            f"'{QUIZ_TOPIC_NAME}' topic exists (send /topic inside it).",
-            _menu_kb(),
-        )
+    if not await _send_message_safe(
+        context.bot, note.render("Note"), parse_mode="HTML", chat_id=dest_chat
+    ):
+        if in_group:
+            await _edit(
+                edit_query,
+                f"❌ Couldn't post to {GROUP_LABEL}. Check QUIZ_CHAT_ID in .env, "
+                "that the bot is still an admin, and that the "
+                f"'{QUIZ_TOPIC_NAME}' topic exists (send /topic inside it).",
+                _menu_kb(),
+            )
+        else:
+            await _edit(
+                edit_query,
+                "❌ Couldn't send the note to this chat — press /start and "
+                "try again.",
+                _menu_kb(),
+            )
         return
-    logger.info("note from %s posted to %s", course.name, GROUP_LABEL)
+    logger.info("note from %s posted to %s", course.name, where)
     await _edit(
         edit_query,
-        f"✅ Posted a note from {course.name} to {GROUP_LABEL} 📖",
+        f"✅ Posted a note from {course.name} to {where} 📖",
         _menu_kb(),
     )
 
@@ -1155,6 +1878,15 @@ async def _scheduler(app: Application) -> None:
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     data = query.data or ""
+    admin = await _is_admin(update, context)
+
+    if not admin and not _is_private(update):
+        # the group's controls belong to its owner and admins
+        await _safe_answer(query, MEMBER_HINT, show_alert=True)
+        return
+    if not admin and not _student_can(data):
+        await _safe_answer(query, ADMIN_ONLY_HINT, show_alert=True)
+        return
 
     if data == "menu:add":
         _set_state(context, ADD_NAME)
@@ -1179,15 +1911,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     elif data == "menu:gen":
         courses = storage.list_courses()
-        if not courses:
+        if not courses and not storage.list_exams():
             await _safe_answer(query, "Add a course first!", show_alert=True)
+            return
+        if admin and _is_private(update):
+            # asked for in a private chat: post it where? (in the group the
+            # answer is obvious, so no question is needed)
+            _set_state(context, GEN_DEST, dest_flow="quiz")
+            await _safe_answer(query)
+            await _edit(query, "Where should I post the quiz?", _dest_kb())
             return
         _set_state(context, GEN_COUNT)
         if query.message:
-            context.user_data["gen_msg"] = (
-                query.message.chat_id,
-                query.message.message_id,
-            )
+            context.user_data["gen_msg"] = _screen_ref(query.message)
         await _safe_answer(query)
         await _edit(
             query,
@@ -1201,13 +1937,60 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not 1 <= count <= MAX_QUESTIONS:
             await _safe_answer(query, f"Pick 1-{MAX_QUESTIONS}.", show_alert=True)
             return
+        dest_chat = context.user_data.get("dest_chat")
         _clear_state(context)
         await _safe_answer(query)
-        await _run_quiz(update, context, count, edit_query=query)
+        await _run_quiz(update, context, count, edit_query=query, dest_chat=dest_chat)
+
+    elif data in ("dest:group", "dest:private"):
+        flow = context.user_data.get("dest_flow")
+        dest_chat = _chat_id(update) if data == "dest:private" else None
+        _clear_state(context)
+        await _safe_answer(query)
+        if flow == "note":
+            await _run_note(context, edit_query=query, dest_chat=dest_chat)
+            return
+        if dest_chat is not None:
+            context.user_data["dest_chat"] = dest_chat
+        _set_state(context, GEN_COUNT)
+        if query.message:
+            context.user_data["gen_msg"] = _screen_ref(query.message)
+        await _edit(
+            query,
+            "How many questions should the quiz have?\n\n"
+            f"Tap a preset below, or type any number from 1 to {MAX_QUESTIONS}.",
+            _qty_kb(),
+        )
+
+    elif data == "menu:squiz":
+        dest_chat = _chat_id(update)
+        if dest_chat is None:
+            await _safe_answer(query, "Press /start first.", show_alert=True)
+            return
+        _clear_state(context)
+        context.user_data["dest_chat"] = dest_chat
+        _set_state(context, GEN_COUNT)
+        if query.message:
+            context.user_data["gen_msg"] = _screen_ref(query.message)
+        await _safe_answer(query)
+        await _edit(
+            query,
+            "How many questions should your quiz have?\n\n"
+            f"Tap a preset below, or type any number from 1 to {MAX_QUESTIONS}.",
+            _qty_kb(),
+        )
+
+    elif data == "menu:how":
+        await _safe_answer(query)
+        await _edit(query, STUDENT_HELP, _student_kb(), parse_mode="HTML")
 
     elif data == "menu:genote":
         _clear_state(context)
         await _safe_answer(query)
+        if admin and _is_private(update):
+            _set_state(context, GEN_DEST, dest_flow="note")
+            await _edit(query, "Where should I post the note?", _dest_kb())
+            return
         await _run_note(context, edit_query=query)
 
     elif data == "menu:aq":
@@ -1239,10 +2022,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
         if query.message:
-            context.user_data["aq_msg"] = (
-                query.message.chat_id,
-                query.message.message_id,
-            )
+            context.user_data["aq_msg"] = _screen_ref(query.message)
         context.user_data["pending_time"] = hhmm
         _set_state(context, AUTO_QUIZ_COUNT)
         await _edit(
@@ -1256,10 +2036,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif data in ("aq:custom", "an:custom"):
         prefix = data.split(":")[0]
         if query.message:
-            context.user_data["aq_msg"] = (
-                query.message.chat_id,
-                query.message.message_id,
-            )
+            context.user_data["aq_msg"] = _screen_ref(query.message)
         _set_state(context, AUTO_QUIZ_TIME if prefix == "aq" else AUTO_NOTE_TIME)
         await _safe_answer(query)
         await _edit(
@@ -1305,12 +2082,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif data in ("menu:back",):
         _clear_state(context)
         await _safe_answer(query)
-        await _edit(query, GREETING, _menu_kb())
+        text, kb = _menu_screen(admin)
+        await _edit(query, text, kb, parse_mode="HTML")
 
     elif data == "menu:cancel":
         _clear_state(context)
         await _safe_answer(query, "Cancelled.")
-        await _edit(query, GREETING, _menu_kb())
+        text, kb = _menu_screen(admin)
+        await _edit(query, text, kb, parse_mode="HTML")
 
     elif data == "add:done":
         if context.user_data.get("state") == EXAM_FILES:
@@ -1321,7 +2100,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif data == "menu:exams":
         _clear_state(context)
         text, kb = _exams_screen()
-        await _edit(query, text, kb)
+        await _edit(query, text, kb, parse_mode="HTML")
 
     elif data == "ex:upload":
         _set_state(context, EXAM_NAME)
@@ -1330,6 +2109,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             query,
             "📝 <b>New exam</b>\n\n"
             "What is this paper called? e.g. <i>Database Midterm 2024</i>",
+            parse_mode="HTML",
         )
 
     elif data.startswith("ex:del:") and data[6:].isdigit():
@@ -1338,7 +2118,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         name = exam.name if exam else "Exam"
         text, kb = _exams_screen()
         await _safe_answer(query)
-        await _edit(query, f"🗑️ '{name}' deleted.\n\n{text}", kb)
+        await _edit(query, f"🗑️ '{name}' deleted.\n\n{text}", kb, parse_mode="HTML")
 
     elif data.startswith("del:") and data[4:].isdigit():
         course = storage.get_course(int(data[4:]))
@@ -1349,7 +2129,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await _edit(query, "Which course do you want to delete?", _course_list_kb(courses))
             else:
                 _clear_state(context)
-                await _edit(query, GREETING, _menu_kb())
+                await _edit(query, GREETING, _menu_kb(), parse_mode="HTML")
             return
         context.user_data["del_id"] = course.id
         _set_state(context, DEL_CONFIRM)
@@ -1377,7 +2157,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _edit(query, "Which course do you want to delete?", _course_list_kb(courses))
         else:
             _clear_state(context)
-            await _edit(query, GREETING, _menu_kb())
+            await _edit(query, GREETING, _menu_kb(), parse_mode="HTML")
 
     else:
         await _safe_answer(query, "Unknown action — use /start.", show_alert=True)
@@ -1433,6 +2213,29 @@ def _bot_id(update: Update) -> int | None:
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = context.user_data.get("state")
     message = update.effective_message
+    admin = await _is_admin(update, context)
+
+    if not admin and not _is_private(update):
+        # the group is the owner's and admins' bot; members are sent to a
+        # private chat for their questions and quizzes
+        if state:
+            _clear_state(context)
+        if _question_from_message(update, message):
+            await _reply(message, MEMBER_HINT)
+        return
+
+    if state in ADMIN_STATES and not admin:
+        _clear_state(context)
+        await _reply(message, ADMIN_ONLY_HINT)
+        return
+
+    if state == GEN_DEST:
+        await _reply(
+            message,
+            "Tap a button above to choose where it goes 🙂",
+            reply_markup=_dest_kb(),
+        )
+        return
 
     if state == EXAM_NAME:
         name = (message.text or "").strip()
@@ -1441,11 +2244,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         exam = storage.create_exam(name)
         _set_state(context, EXAM_FILES, exam_id=exam.id)
-        msg_ref = context.user_data.get("exam_msg") or (
-            message.message_id,
-            update.effective_chat.id,
-        )
-        context.user_data["exam_msg"] = msg_ref
         await _reply(
             message,
             f"📄 Now send the exam PDF for '{name}'.\n\n"
@@ -1482,7 +2280,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "The course changes every day, so no two notes in a row come "
                 "from the same one."
             )
-            if msg_ref and await _edit_text_safe(
+            if msg_ref and _ref_in_topic(msg_ref) and await _edit_text_safe(
                 context.bot, msg_ref[0], msg_ref[1], text, _menu_kb()
             ):
                 return
@@ -1497,7 +2295,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "have?\n\nTap a preset below, or type any number from 1 to "
             f"{MAX_QUESTIONS}."
         )
-        if msg_ref and await _edit_text_safe(
+        if msg_ref and _ref_in_topic(msg_ref) and await _edit_text_safe(
             context.bot, msg_ref[0], msg_ref[1], text, _auto_qty_kb()
         ):
             return
@@ -1531,7 +2329,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"✅ Auto Quiz is ON — every day at {settings['time']} I'll post "
             f"{count} mixed questions to {GROUP_LABEL}."
         )
-        if msg_ref and await _edit_text_safe(
+        if msg_ref and _ref_in_topic(msg_ref) and await _edit_text_safe(
             context.bot, msg_ref[0], msg_ref[1], text, _menu_kb()
         ):
             return
@@ -1551,8 +2349,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
         msg_ref = context.user_data.get("gen_msg")
+        dest_chat = context.user_data.get("dest_chat")
         _clear_state(context)
-        await _run_quiz(update, context, count, msg_ref=msg_ref, fallback=message)
+        await _run_quiz(
+            update,
+            context,
+            count,
+            msg_ref=msg_ref,
+            fallback=message,
+            dest_chat=dest_chat,
+        )
         return
 
     if state == ADD_NAME:
@@ -1592,6 +2398,17 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     message = update.effective_message
     doc = message.document
     state = context.user_data.get("state")
+
+    if not await _is_admin(update, context):
+        if state in ADMIN_STATES:
+            _clear_state(context)
+        if _is_private(update):
+            await _reply(
+                message,
+                "🔒 Saving material is for the group owner and admins. "
+                "Ask me a question or press /start for a quiz instead 💬",
+            )
+        return
 
     uploading_exam = state == EXAM_FILES and context.user_data.get("exam_id")
     uploading_course = state == ADD_FILES and context.user_data.get("course_id")
@@ -1700,6 +2517,17 @@ def main() -> None:
             "BOT_TOKEN is missing. Copy .env.example to .env and add your "
             "@BotFather token, then run the bot again."
         )
+    lock = _acquire_single_instance_lock()
+    if lock is None:
+        raise SystemExit(
+            f"Another copy of the bot is already running (lock: {_lock_path()}).\n"
+            "Telegram only delivers updates to one instance at a time, so stop "
+            "the other one first — including a copy running on a server or a "
+            "second terminal window.\n"
+            "If you are sure nothing else is running, delete that file and "
+            "start the bot again."
+        )
+    atexit.register(_release_single_instance_lock, lock)
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -1714,8 +2542,11 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("topic", cmd_topic))
+    app.add_handler(CommandHandler(["cleanup", "purge"], cmd_cleanup))
     app.add_handler(
-        CallbackQueryHandler(on_button, pattern=r"^(menu:|add:|del:|gen:|aq:|an:|ex:)")
+        CallbackQueryHandler(
+            on_button, pattern=r"^(menu:|add:|del:|gen:|aq:|an:|ex:|dest:)"
+        )
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))

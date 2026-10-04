@@ -14,9 +14,40 @@ course · file · page number** — so students can open the exact part of the
 material and re-read it. The same rule holds for `/ask`: answers are sentences
 copied out of your PDFs, never generated prose.
 
-Everything the bot posts goes into one **forum topic** (`study room` by
+Everything the bot posts goes into one **forum topic** (`Study Room` by
 default), so quizzes, notes and answers stay together and out of the rest of
 the group chat.
+
+## Who can use the bot
+
+The bot belongs to the **group owner and its admins**. Everyone else can only
+talk to it in a **private chat**.
+
+| | Owner / admins | Everyone else |
+|---|---|---|
+| Menu in the group | ✅ full | ❌ told to DM the bot |
+| Add / delete courses, exams, schedules | ✅ | ❌ |
+| `baymax …` / `/ask` in the group | ✅ | ❌ pointed at a private chat |
+| Ask questions in a private chat | ✅ | ✅ |
+| Get a quiz in a private chat | ✅ (chooses group or private) | ✅ (always their own chat) |
+| Notes in a private chat | ✅ (chooses group or private) | ❌ |
+
+Membership is read from Telegram (`getChatMember`) and cached for a minute, so
+demoting someone takes effect within a minute. If the check cannot be
+completed — no chat attached, network trouble — the bot **fails open** rather
+than locking the owner out of their own bot.
+
+An admin who presses **Generate Quiz** or **Generate Note** *in a private chat*
+is asked where to post it:
+
+```
+Where should I post the quiz?
+[ 📌 To the group ]
+[ 💬 Here in this chat ]
+```
+
+In the group the question is not asked — the group is the obvious answer. A
+student never sees the question: their quiz always goes to their own chat.
 
 ## The flow
 
@@ -26,30 +57,88 @@ the group chat.
 |---|---|
 | **Add Course** | Asks for the course name → you send as many PDFs as you like → press **Done** → course is saved (texts are extracted and cached) |
 | **Delete Course** | Lists your courses → pick one → *"Are you sure?"* → **Yes, Delete** / **Cancel** |
-| **Generate Quiz** | Asks **how many questions** (presets 5/10/15/25/50 — or type any number 1–50), then builds a quiz mixing every course (round-robin, so big courses don't drown out small ones) and posts it to the group |
-| **Generate Note** | Picks a **random course** and posts one note from it **in the group** — the same message the daily note uses, so you can see it before turning the automation on |
+| **Generate Quiz** | Asks **how many questions** (presets 5/10/15/25/50 — or type any number 1–50), then builds a quiz mixing every course (round-robin, so big courses don't drown out small ones) and posts it. In a private chat an admin is first asked **where**: the group or that chat |
+| **Generate Note** | Picks a **random course** and posts one note from it — the same message the daily note uses, so you can see it before turning the automation on. In a private chat an admin is first asked **where** |
 | **⏰ Auto Quiz** | Shows the current status (**ON**/**OFF**), a description, and time buttons in 24-hour format → pick a time (or **⌨️ Custom time** and type it) → asks how many questions → the daily quiz is ready |
 | **📝 Auto Note** | Same screen and time picker, but no quantity — at the chosen time a note from a random course is posted every day |
 | **📚 Exams** | Save past exam papers *with their answers* — about 30% of every quiz then uses the real questions from them. Tap a saved paper to delete it |
 
-Commands: `/start` · `/help` · `/cancel` · `/ask <question>` · `/topic`
+Students get a smaller menu instead: **🎯 Send me a quiz** and **🔎 How to
+ask**. The same two buttons appear under every answer in a private chat.
+
+Commands: `/start` · `/help` · `/cancel` · `/ask <question>` · `/topic` · `/cleanup`
 
 ## Everything goes in one topic
 
-Quizzes, daily notes and every answer are posted into the **study room** topic
+Quizzes, daily notes and every answer are posted into the **Study Room** topic
 rather than the group's General chat.
 
 Telegram gives a topic a numeric id that every message must carry, and there
 is no API to look one up by name — so the bot learns it, in any of these ways:
 
-1. **Do nothing.** When someone creates a topic named `study room`, Telegram
+1. **Do nothing.** When someone creates a topic named `Study Room`, Telegram
    sends the bot the new topic's id, and it remembers it.
 2. **Send `/topic` from inside the topic** — the bot learns it from wherever
-   the command came from.
+   the command came from (admins only).
 3. **Pin it** — put `QUIZ_TOPIC_ID=<id>` in `.env`.
 
 The name is configurable with `QUIZ_TOPIC_NAME`. If the id is not known yet,
-the bot logs a hint at startup and falls back to General.
+the bot logs a hint at startup and falls back to General. A topic id that
+Telegram later rejects (topic deleted, wrong id pinned) is **forgotten
+automatically** and the next send lands in General instead of failing forever.
+
+### Nothing is posted anywhere else
+
+The topic is not just where quizzes go — it is where **everything** goes:
+
+* a `/start`, `/ask` or `baymax …` asked in **General or another topic** is
+  answered *inside* the Study Room, and the question travels with the answer
+  (`❓ <question>` above it) so the topic stays readable;
+* a menu screen that was opened outside the topic is **moved in** — the new
+  screen appears in the topic and the old one is blanked to
+  `➡️ Moved to the Study Room topic.` so no flow keeps running in General;
+* private chats are never redirected: a student asking the bot directly is
+  answered right there.
+
+### `/cleanup` — delete what landed elsewhere
+
+Telegram has no API for "list my own messages", so the bot writes down every
+group message it sends together with the topic it landed in
+(`data/outbox.json`). **`/cleanup`** (admins only) deletes everything recorded
+outside the Study Room:
+
+```/cleanup
+🗑 Deleted 6 messages from outside the Study Room topic.
+⚠️ 1 could not be deleted right now — run /cleanup again shortly.
+```
+
+* **Reply to one of the bot's messages** while sending `/cleanup` to delete
+  just that one message. (If the message is not the bot's, it says so instead
+  of deleting a student's message.)
+* **Older messages**, sent before the bot started keeping track, need either
+  the reply trick or a **range**:
+
+```
+/cleanup 1234-1290          # or: /cleanup from 1234 to 1290
+```
+
+  Open any message in **web.telegram.org** — the last number in its link is
+  the message id. The sweep deletes only messages Telegram lets the bot
+  delete, i.e. **its own**, and skips ids it knows it posted inside the topic.
+  At most 300 ids per run.
+
+  Per the Bot API, a bot may always delete its own messages, but deleting
+  anyone else's needs `can_delete_messages` in a supergroup (or plain admin in
+  a basic group). If the bot ever gets that right, the sweep is **refused**
+  rather than risk a student's message — the reply form still works.
+* Telegram only allows a bot to delete its own messages **within 48 hours**;
+  older ones are reported as already gone and forgotten.
+* No admin right is needed for this: deleting *your own* messages does not
+  require the "Delete messages" permission — that right only governs deleting
+  **other people's** messages. If Telegram refuses anyway, `/cleanup` shows
+  its exact words.
+* It is safe to run repeatedly — only messages that are actually outside the
+topic are touched.
 
 ## How questions are chosen
 
@@ -104,19 +193,21 @@ entity in a set distinctly.
 
 ### Asking in the group
 
-`/ask …` works anywhere. In a group the bot **only listens when it is spoken
-to directly**, so it doesn't read along with everyone's chat:
+`/ask …` works anywhere. In a group **only the owner and admins are answered** —
+everyone else is pointed at a private chat — and the bot **only listens when it
+is spoken to directly**, so it doesn't read along with everyone's chat:
 
 * say **“baymax what is a weak entity”** — the wake word calls the bot
   (`jarvis`, `jarves` and `bay max` are recognised too, in any spelling);
 * **reply to one of the bot's messages** and just type the question;
 * send `/ask <question>` — a command always reaches the bot;
-* or ask in a **private chat** with the bot, where nothing is posted publicly.
+* or ask in a **private chat** with the bot, where nothing is posted publicly
+  and anyone in the group can do it.
 
 Anything else in the group is ignored. Because of this, privacy mode can stay
 **enabled** — you don't need `/setprivacy → Disable` to use `/ask`. You only
-need it if you send PDFs into the group itself; adding them in a private chat
-works with privacy mode on.
+need it for the `baymax …` wake word without a reply, or if you send PDFs into
+the group itself; both work from a private chat with privacy mode on.
 
 ## Exams — using past papers
 
@@ -213,6 +304,21 @@ No activation? Call the venv Python directly:
 First startup takes ~25 seconds on Windows (antivirus scans the Telegram
 library) — give it a moment before the `Bot started` log appears.
 
+**Run only one copy at a time.** Telegram gives a bot's updates to a single
+poller; a second copy used to fill the log with
+`Conflict: terminated by other getUpdates request` and quietly fight the first
+one for updates. It now refuses to start instead:
+
+```
+Another copy of the bot is already running (lock: …\data\bot.lock).
+Telegram only delivers updates to one instance at a time, so stop the other
+one first — including a copy running on a server or a second terminal window.
+```
+
+That matters after a deploy too: stop the local copy before the server one
+starts (or vice versa). The lock file is removed on a clean exit and is
+taken over automatically if a copy crashed, so it never blocks a restart.
+
 ### ⚠️ Important: privacy mode (optional)
 
 The bot only receives group messages addressed to it unless privacy mode is
@@ -220,8 +326,15 @@ disabled. **You do not need to disable it for quizzes, notes or `/ask`** —
 commands, inline buttons and replies to the bot all work with privacy mode on.
 
 Disable it (Telegram: **@BotFather → /setprivacy → Disable → your bot**, then
-restart the bot) only if you want to **send course PDFs from inside the
-group**. Adding them in a private chat with the bot works either way.
+restart the bot) if you want either of these:
+
+* **the `baymax …` wake word in the group** — with privacy mode on, Telegram
+  does not forward plain group text, so an admin would have to reply to one of
+  the bot's messages or use `/ask` instead;
+* **sending course PDFs from inside the group**.
+
+Adding material in a private chat with the bot works either way, and every
+question asked in a private chat works either way.
 
 ## Storage
 
@@ -233,6 +346,8 @@ data/
   exams.json          # index of old exam papers
   automation.json     # daily Auto Quiz / Auto Note schedules
   topics.json         # learned forum topic ids (name -> id)
+  outbox.json         # every group message the bot sent, and its topic
+  bot.lock            # single-instance lock (written at start, removed at exit)
   courses/<id>/       # the PDFs + cached .txt extractions
   exams/<id>/         # one folder per uploaded exam paper
 ```
@@ -251,8 +366,9 @@ against Telegram's poll limits, the junk-filtering rules (bullets, truncated
 sentences, purpose clauses, running heads), storage lifecycle, mixed-quiz
 generation, note formatting, BM25 retrieval and `/ask` answers, old-exam
 parsing and quiz mixing, forum-topic routing, the wake-word trigger, the
-24-hour time input, the daily scheduling rules and the auto quiz / auto note
-menu flows.
+24-hour time input, the daily scheduling rules, the auto quiz / auto note
+menu flows, the permission rules (who may press what, where a quiz or note is
+posted), the redirect of everything into the Study Room topic and `/cleanup`.
 
 ## Project layout
 
