@@ -130,7 +130,7 @@ TICK_SECONDS = 20
 
 GREETING = (
     "👋 Hey! I'm baymax an AI assitance trained from your old matrial you used to read.\n\n"
-    "Organize your study PDFs into courses, and I'll turn them into mixed "
+    "Organize your study PDFs into courses, and I'll turn them into mixed question to test youhow much you remenber from past"
     "quiz polls for the group.\n\n"
     "• Add Course — save PDFs under a course name\n"
     "• Delete Course — remove a course (with confirmation)\n"
@@ -202,14 +202,14 @@ MEMBER_HINT = (
 ADMIN_ONLY_HINT = "🔒 That's for the group owner and admins only."
 
 STUDENT_GREETING = (
-    "👋 Hey! I'm Baymax, the study bot for @practicemakesperfect2.\n\n"
+    "👋 Hey! I'm Baymax, the study bot for computer Science 2016 batch students.\n\n"
     "🔎 <b>Ask me anything</b> from the course PDFs — just type your question, "
     "for example <i>what is a weak entity</i>. I answer with the sentence from "
     "the material and show its course · file · page.\n\n"
     "🎯 <b>Send me a quiz</b> — a mixed quiz posted right here in this chat, "
     "with as many questions as you want.\n\n"
     "The group owner and admins manage the courses, exams and schedules; "
-    "whatever you ask stays in this chat."
+    "whatever you ask stays in this chat.feel free"
 )
 
 STUDENT_HELP = (
@@ -1351,7 +1351,7 @@ async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
         storage.forget_sent([replied.message_id])
-        await _reply(message, "🗑 Deleted that message.")
+        await _reply(message, "🗑")
         return
 
     # /cleanup 1234-1290 sweeps an id range — the only way to reach messages
