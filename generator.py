@@ -1344,7 +1344,7 @@ class Answer:
         Nothing here is generated prose — every line is a sentence copied out
         of a PDF, so the student can check it against their own material.
         """
-        head = "📖 <b>From your material</b>" if self.is_definition else "📖 <b>Closest match</b>"
+        head = "📖 <b>From your material</b>" if self.is_definition else "📖 <b>Closest Answer</b>"
         lines = [head, "", escape(self.text)]
         refs: list[str] = []
         if self.filename or self.course:
