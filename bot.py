@@ -129,7 +129,7 @@ TIME_PRESETS = ("07:00", "08:00", "12:00", "13:00", "17:00", "18:00", "20:00", "
 TICK_SECONDS = 20
 
 GREETING = (
-    "👋 Hey! I'm the course quiz bot for @practicemakesperfect2.\n\n"
+    "👋 Hey! I'm baymax an AI assitance trained from your old matrial you used to read.\n\n"
     "Organize your study PDFs into courses, and I'll turn them into mixed "
     "quiz polls for the group.\n\n"
     "• Add Course — save PDFs under a course name\n"
