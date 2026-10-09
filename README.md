@@ -6,13 +6,15 @@ true/false Telegram quiz polls) built from *all* courses and post it to the grou
 on demand, or automatically every day at a time you pick. It can also post a
 daily **note** from a random course, and **answer questions about your notes**.
 
-Generation is **rule-based** (no AI API, no cost): text is extracted with
-`pdfplumber`, cleaned of layout debris, and turned into questions only from
-sentences that actually state a definition or a fact. After someone answers,
-Telegram shows an explanation with the original sentence **and its source —
-course · file · page number** — so students can open the exact part of the
-material and re-read it. The same rule holds for `/ask`: answers are sentences
-copied out of your PDFs, never generated prose.
+Generation is **hybrid — works with or without an LLM**:
+
+| Mode | Quiz | Ask | Note |
+|------|------|-----|------|
+| **No API key** (zero config) | 7 rule-based types mapped to Bloom's taxonomy (recall → analyze), grounded distractors | Hybrid BM25 + semantic embeddings when `sentence-transformers` is installed, otherwise BM25 | Structured 1–3 bullet synthesis, ranked by causal/comparative relevance |
+| **With LLM** (`OPENAI_API_KEY` / `GEMINI_API_KEY` / `GROQ_API_KEY` / Ollama) | LLM generates fluent, scenario/comparison/cause-effect questions from RAG context; validated & deduped, rule-based fills any gap | RAG answering with citation + hallucination guard (word-overlap + `NOT_FOUND`) | LLM synthesis with grounding check |
+| **Fallback** | If LLM fails or returns invalid JSON, rule-based engine takes over — the bot never breaks | Same — BM25/hybrid is the safety net | Same |
+
+In every mode every answer cites **course · file · page** so you can re-read the exact part. Text is extracted with `pdfplumber` and cleaned of layout debris; the LLM path adds RAG grounding so nothing is hallucinated.
 
 Everything the bot posts goes into one **forum topic** (`Study Room` by
 default), so quizzes, notes and answers stay together and out of the rest of
@@ -152,11 +154,9 @@ it states something a student could be right or wrong about:
   denote paths" qualifies. "Color change is one rectangle at a time" and
   "The goal is to get one liter of water" do not — a purpose clause is not a
   definition.
-* **Four question kinds** — *which term is described as …*, *______ is …*,
-  a *number* blank, and *true/false* where a central term or a number has been
-  swapped for a plausible wrong one.
+* **Seven question kinds** across Bloom's taxonomy — *which term is described as …* (recall), *______ is …* (recall), *number* blank (recall), *true/false* (understand), *scenario/case* — "in a scenario where … which term applies?" (apply), *comparison* — contrasting two concepts (analyze), *cause → effect* (analyze).
 * **True/false is capped** at roughly a third of a quiz, so a quiz stays a
-  quiz rather than a run of coin flips.
+   quiz rather than a run of coin flips. New Bloom-level types are capped similarly to keep variety.
 * **Layout debris is dropped** — Wingdings bullets, headings, tables of
   contents, figure captions, "Individual Assignment (5%)", running heads, and
   columns bleeding into each other.
@@ -168,9 +168,12 @@ it states something a student could be right or wrong about:
 /ask what is a weak entity
 ```
 
-The bot searches every course with **BM25** (a ranking function that rewards a
-rare word appearing often in one sentence, without letting long pages win on
-length alone) and replies with the sentence that answers it:
+The bot searches every course with a **hybrid retriever** — BM25 exact-match plus
+dense semantic embeddings (`sentence-transformers` / `all-MiniLM-L6-v2`) fused via
+RRF and optional cross-encoder reranking. With no extra install it is BM25 only;
+with `pip install sentence-transformers` it understands paraphrases and synonyms.
+When an LLM is configured, answering upgrades to full **RAG** (retrieved context →
+grounded generation) with a hallucination guard. It replies with:
 
 ```
 📖 From your material
@@ -183,8 +186,9 @@ entity in a set distinctly.
 📎 Database · DB CH3.pdf · p.6
 ```
 
-* The answer is always a **sentence from your PDFs**, never a summary written
-  by the bot.
+* The answer is always **grounded in your PDFs** — BM25/hybrid returns a copied
+   sentence, RAG returns a synthesized answer but only if it overlaps the retrieved
+   context (otherwise `NOT_FOUND`). No hallucination.
 * If the material doesn't contain the answer, the bot says so
   ("I couldn't find that in your notes") instead of returning a sentence that
   merely looks related. A question using a word that appears nowhere in the
@@ -276,8 +280,42 @@ membranes of chloroplasts.
 📃 Page: 12
 ```
 
-The note is a central term with its definition, plus a second sentence about the
-same term from elsewhere in the material.
+The note is a central term with its definition, plus up to two supporting bullets
+(ranked: causal explanation > comparison > example > variety) from elsewhere in the
+material. When an LLM is configured the note is synthesized from RAG context with
+a grounding check; otherwise the structured rule-based note is used.
+
+## AI upgrade — zero-config to LLM-grade
+
+The bot works out of the box with no API key. To go LLM-grade, add **one** of
+these to `.env` (first available wins when `LLM_PROVIDER=auto`):
+
+```ini
+# Pick one — best to cheapest:
+OPENAI_API_KEY=sk-...          # gpt-4o-mini (best quality)
+GROQ_API_KEY=gsk_...           # llama-3.3-70b (fast & cheap)
+GEMINI_API_KEY=AIza...         # gemini-2.0-flash (generous free tier)
+# Local — no key, no cost:
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=llama3.1:8b
+```
+
+Optional routing / tuning:
+
+```ini
+LLM_PROVIDER=auto              # auto | openai | gemini | groq | ollama | none
+LLM_MODEL=gpt-4o-mini          # override model name
+LLM_BASE_URL=https://...       # proxy / custom Ollama host
+LLM_TIMEOUT=25                 # seconds
+```
+
+New modules (all optional, bot runs without them):
+
+- `llm_client.py` — unified client for OpenAI / Gemini / Groq / Ollama; JSON-mode helpers.
+- `retriever.py` — `HybridRetriever` (BM25 + `all-MiniLM-L6-v2` dense + cross-encoder rerank via RRF). Install with `pip install sentence-transformers`.
+- `ai_generator.py` — `ai_generate_questions` / `ai_answer_question` / `ai_generate_note` — RAG-grounded LLM generation with strict validation, dedup and rule-based fallback. Never hallucinates: every LLM output must overlap retrieved context.
+
+What changes for the user: quizzes gain scenario / comparison / cause-effect questions (Bloom apply/analyze), `/ask` understands paraphrases, notes become multi-bullet syntheses — and without a key the new rule-based Bloom types + structured notes still improve over the old bot.
 
 ## Setup
 
@@ -373,8 +411,11 @@ posted), the redirect of everything into the Study Room topic and `/cleanup`.
 ## Project layout
 
 ```
-bot.py        # menu + inline-button state machine, sends polls/notes, /ask, runs the daily schedules
-generator.py  # PDF text extraction + rule-based questions, notes, BM25 retrieval and /ask
-storage.py    # course CRUD (JSON index + per-course folders) + automation settings
-tests/        # unit tests (self-contained, no sample files needed)
+bot.py          # menu + inline-button state machine, sends polls/notes, /ask, runs the daily schedules
+generator.py    # PDF extraction + 7 rule-based Bloom question types, structured notes, BM25
+storage.py      # course CRUD (JSON index + per-course folders) + automation settings
+llm_client.py   # unified LLM client (OpenAI/Gemini/Groq/Ollama) with auto-fallback
+retriever.py    # HybridRetriever — BM25 + dense + RRF + rerank
+ai_generator.py # hybrid LLM layer (RAG quiz/answer/note + validation + fallback)
+tests/          # unit tests (self-contained, no sample files needed)
 ```

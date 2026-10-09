@@ -61,10 +61,31 @@ from generator import (
     InsufficientTextError,
     Note,
     Retriever,
+    Segment,
     generate_mixed_questions,
     generate_note,
     questions_from_exams,
 )
+# AI layer — graceful fallback if llm_client not configured
+try:
+    from ai_generator import (
+        ai_answer_question as _ai_answer,
+        ai_answer_question_async as _ai_answer_async,
+        ai_generate_note as _ai_note,
+        ai_generate_note_async as _ai_note_async,
+        ai_generate_questions as _ai_questions,
+        ai_generate_questions_async as _ai_questions_async,
+    )
+    _AI_AVAILABLE = True
+except ImportError:
+    _AI_AVAILABLE = False
+
+try:
+    from retriever import HybridRetriever
+    _HYBRID_AVAILABLE = True
+except ImportError:
+    _HYBRID_AVAILABLE = False
+    HybridRetriever = Retriever  # type: ignore
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -1097,12 +1118,58 @@ def _drop_ask_index() -> None:
     _ASK_INDEX = None
 
 
-def _answer(query: str) -> Answer | None:
-    """The best answer to `query` across every course.
+def _all_segments() -> list[Segment]:
+    """Every segment from every course — for hybrid LLM answering."""
+    segs: list[Segment] = []
+    for _, segments in _build_sources():
+        segs.extend(segments)
+    return segs
 
-    The answer stays a sentence copied from a PDF, so the student can check it
-    against their own notes; it is never generated prose.
+
+def _answer(query: str) -> Answer | None:
+    """Hybrid answer: LLM RAG first, then BM25 fallback.
+
+    LLM answers are grounded (overlap guard) and never hallucinated;
+    rule-based is the safety net so the bot always responds.
     """
+    if _AI_AVAILABLE:
+        try:
+            all_segs = _all_segments()
+            if all_segs:
+                llm_ans = _ai_answer(query, all_segs)
+                if llm_ans is not None:
+                    return llm_ans
+        except Exception:
+            logger.exception("AI answer failed, falling back to BM25")
+    # Fallback: hybrid semantic+BM25 when available, else plain BM25
+    if _HYBRID_AVAILABLE:
+        try:
+            all_segs = _all_segments()
+            if all_segs:
+                hr = HybridRetriever(all_segs, enable_rerank=False)
+                # Try semantic-enhanced search
+                from generator import _focus_terms, _GENERIC_QUERY_WORDS, _QWORDS
+                hits = hr.search(query, limit=4, rerank=False)
+                if hits:
+                    # Grounding check: best hit must contain a required query word
+                    focus = _focus_terms(query)
+                    required = [w for w in focus if w.lower() not in _GENERIC_QUERY_WORDS and len(w) >= 4]
+                    if required:
+                        best_words = {w.lower() for w in _QWORDS.findall(hits[0][0].text)}
+                        if not any(w.lower() in best_words for w in required):
+                            return None
+                    # Prefer definition if material defines the queried term
+                    for w in focus:
+                        exact = hr.define(w)
+                        if exact is not None:
+                            return Answer(query=query, text=exact.text, course=exact.course, filename=exact.filename, page=exact.page, is_definition=True)
+                    sent, _ = hits[0]
+                    # Find best course name
+                    course_name = sent.course or ""
+                    return Answer(query=query, text=sent.text, course=course_name, filename=sent.filename, page=sent.page)
+        except Exception:
+            logger.exception("Hybrid fallback failed, using BM25")
+    # Last resort: best BM25 hit across courses (original behaviour)
     best: tuple[float, Answer] | None = None
     for name, index in _ask_indexes():
         hits = index.search(query, limit=4)
@@ -1121,6 +1188,20 @@ def _answer(query: str) -> Answer | None:
     if best is None:
         return None
     return best[1]
+
+
+async def _answer_async(query: str) -> Answer | None:
+    """Async hybrid answer for the event loop."""
+    if _AI_AVAILABLE:
+        try:
+            all_segs = _all_segments()
+            if all_segs:
+                ans = await _ai_answer_async(query, all_segs)
+                if ans is not None:
+                    return ans
+        except Exception:
+            logger.exception("AI async answer failed, falling back")
+    return await asyncio.to_thread(_answer, query)
 
 
 async def _ask(query: str, message) -> None:
@@ -1153,7 +1234,8 @@ async def _ask(query: str, message) -> None:
         )
         return
 
-    answer = await asyncio.to_thread(_answer, query)
+    # Hybrid: LLM RAG first, BM25 fallback (both run off the event loop)
+    answer = await _answer_async(query) if _AI_AVAILABLE else await asyncio.to_thread(_answer, query)
     if answer is None:
         await say(
             "🤷 I couldn't find that in your notes. I only answer from the "
@@ -1565,13 +1647,11 @@ def _build_exam_sources() -> list[tuple[str, list]]:
 
 
 def _build_quiz(count: int, seed: int | None = None):
-    """A mixed quiz: mostly course notes, plus a share from past exams.
+    """Hybrid mixed quiz: LLM-powered when configured, rule-based fallback.
 
-    Old exam questions are the real thing a student sat, so they get a slice of
-    every quiz (EXAM_SHARE) when papers are available. The rest is generated
-    from the notes as usual, so exams enrich the quiz instead of replacing it.
-    A student who has only exams still gets a quiz — the paper text stands in
-    for the notes.
+    LLM generates Bloom-aware questions (scenario, comparison, cause-effect) from
+    the material; exams still contribute EXAM_SHARE verbatim. If LLM is absent
+    or fails validation, the original engine fills the quiz.
     """
     sources = _build_sources()
     exam_sources = _build_exam_sources()
@@ -1589,16 +1669,39 @@ def _build_quiz(count: int, seed: int | None = None):
             exam_sources, exam_quota, note_pool or None, rng
         )
 
-    # a paper on its own may be too small to generate from — the exam's own
-    # questions are still perfectly good material, so fall back to those
-    try:
-        from_notes, _skipped = generate_mixed_questions(
-            note_sources, max(1, count - exam_quota), seed
-        )
-    except InsufficientTextError:
-        if not from_exams:
-            raise
-        from_notes = []
+    note_quota = max(1, count - len(from_exams))
+
+    # Try LLM for the notes portion
+    from_notes: list = []
+    if _AI_AVAILABLE and sources:
+        try:
+            # collect all note segments
+            all_note_segs: list[Segment] = []
+            for _, segs in sources:
+                all_note_segs.extend(segs)
+            if all_note_segs:
+                llm_qs = _ai_questions(all_note_segs, note_quota, seed)
+                if llm_qs:
+                    from_notes = llm_qs
+        except Exception:
+            logger.exception("AI quiz generation failed, falling back to rule-based")
+            from_notes = []
+
+    # Fallback / supplement with rule-based if LLM gave too few
+    if len(from_notes) < note_quota:
+        remaining = note_quota - len(from_notes)
+        try:
+            rb_qs, _skipped = generate_mixed_questions(note_sources, remaining, seed)
+            # dedup against LLM questions
+            seen = {__import__("re").sub(r"\W+", "", q.text.lower())[:60] for q in from_notes}
+            for q in rb_qs:
+                key = __import__("re").sub(r"\W+", "", q.text.lower())[:60]
+                if key not in seen:
+                    from_notes.append(q)
+                    seen.add(key)
+        except InsufficientTextError:
+            if not from_notes and not from_exams:
+                raise
 
     questions = from_notes + from_exams
     if not questions:
@@ -1606,7 +1709,8 @@ def _build_quiz(count: int, seed: int | None = None):
             "None of the courses had enough readable text to build a quiz."
         )
     rng.shuffle(questions)
-    return questions
+    # hard cap
+    return questions[:count]
 
 
 async def _post_questions(bot, questions, chat_id=None) -> int:
@@ -1748,7 +1852,14 @@ def _pick_note(exclude_course_id: int | None = None) -> tuple[storage.Course | N
     rng.shuffle(pool)
     for course in pool:
         try:
-            return course, generate_note(storage.course_segments(course.id), seed=rng.randrange(1 << 30))
+            segs = storage.course_segments(course.id)
+            if _AI_AVAILABLE:
+                try:
+                    note = _ai_note(segs, seed=rng.randrange(1 << 30))
+                    return course, note
+                except Exception:
+                    logger.exception("AI note failed for %s, falling back", course.name)
+            return course, generate_note(segs, seed=rng.randrange(1 << 30))
         except Exception:
             logger.exception("failed building a note from %s", course.name)
             continue

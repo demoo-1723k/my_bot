@@ -1,4 +1,4 @@
-"""Turn PDF study material into quiz questions and notes (rule-based, no AI API).
+"""Turn PDF study material into quiz questions and notes (hybrid: rule-based + LLM-ready).
 
 Pipeline
 --------
@@ -9,18 +9,24 @@ Pipeline
    furniture, figure captions, and vacuous "definitions" such as
    *"Color change is one rectangle at a time."*
 3. Decide which words are worth asking about. A good study term is **recurrent
-   and central**: it shows up several times and on several pages. A word used
-   once on one page ("rectangle" in a worked example) scores low and is almost
-   never used as a blank or a distractor.
-4. Build four kinds of question, always anchored on that material:
-   - ``def2term``  *Which term is described as …?*   (from "X is Y")
-   - ``term2def``  *______ is Y*                      (blank the term)
-   - ``number``    *______* with a numeric distractor set
-   - ``tf``        true/false, mutated from a real fact (a number or a key term)
-   Distractors are always **other central terms of the same shape** — never a
-   random word pulled from somewhere else in the document.
+    and central**: it shows up several times and on several pages. A word used
+    once on one page ("rectangle" in a worked example) scores low and is almost
+    never used as a blank or a distractor.
+4. Build SEVEN kinds of question, mapped to Bloom's taxonomy:
+    - ``def2term``     Recall — *Which term is described as …?*   (from "X is Y")
+    - ``term2def``     Recall — *______ is Y*                      (blank the term)
+    - ``number``       Recall — *______* with a numeric distractor set
+    - ``tf``           Understand — true/false, mutated from a real fact
+    - ``scenario``     Apply — definition turned into a mini-case study
+    - ``comparison``   Analyze — *How does X differ from Y?*
+    - ``cause_effect`` Analyze — *What causes / results from X?*
+    Distractors are always **other central terms of the same shape** — never a
+    random word pulled from somewhere else in the document.
 5. Every question's explanation quotes the source sentence and cites
-   course · file · page, so a student can re-read the exact part.
+    course · file · page, so a student can re-read the exact part.
+6. When an LLM is configured (OPENAI_API_KEY / GEMINI_API_KEY / GROQ_API_KEY /
+    Ollama), ai_generator.py upgrades the same flow with fluent, grounded
+    generation — the rule-based engine remains the zero-config fallback.
 """
 
 from __future__ import annotations
@@ -233,7 +239,11 @@ class Note:
         else:
             lines.append(escape(self.text))
         if self.detail:
-            lines += ["", f"💡 {escape(self.detail)}"]
+            # detail may hold "sentence1 § sentence2" = two bullets
+            for part in self.detail.split(" § "):
+                part = part.strip()
+                if part:
+                    lines += ["", f"💡 {escape(part)}"]
         meta: list[str] = []
         if self.course:
             meta.append(f"📚 Course: <b>{escape(self.course)}</b>")
@@ -1038,16 +1048,156 @@ def _build_tf(sent: Segment, stats: TermStats, rng: random.Random) -> Question |
     )
 
 
+# --- New Bloom-level builders (Apply / Analyze) ---------------------------
+
+# Lightweight linguistic signals — no LLM needed.
+_CAUSE_RE = re.compile(
+    r"\b(because|since|therefore|thus|hence|due to|results? in|leads? to|"
+    r"causes?|caused by|effect of|in order to|so that)\b",
+    re.IGNORECASE,
+)
+_COMPARISON_RE = re.compile(
+    r"\b(while|whereas|unlike|compared to|in contrast|difference between|"
+    r"versus|vs\.?|on the other hand|however|although|but)\b",
+    re.IGNORECASE,
+)
+# "If X then Y" / "When X, Y" — scenario-like structure
+_CONDITIONAL_RE = re.compile(
+    r"^\s*(if|when|whenever|given|suppose|consider|assume)\b",
+    re.IGNORECASE,
+)
+
+
+def _build_scenario(sent: Segment, stats: TermStats, rng: random.Random) -> Question | None:
+    """Apply: turn a definition into a mini-case question.
+
+    Example: "A weak entity has no key" -> "A database table has no primary key
+    of its own. What kind of entity is it?"  The scenario prefix is synthesized
+    from the definition body so it stays grounded.
+    """
+    definition = _find_definition(sent.text)
+    if definition is None or not stats.is_key(definition.term):
+        return None
+    display = _ARTICLE_RE.sub("", definition.term).strip() or definition.term
+    if not stats.is_key(display):
+        return None
+    distractors = _distractors(display, stats, rng, sent.page, source=sent.text)
+    if len(distractors) < 2:
+        return None
+    shape = _options_from(rng, display, distractors)
+    if shape is None:
+        return None
+    options, correct_index = shape
+
+    body = definition.body.strip().rstrip(".")
+    # Keep prompt concise for Telegram limits
+    if len(body) > 130:
+        body = body[:130].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
+    # Scenario framing — still cites the real definition
+    text = _cap_question(f'In a scenario where {body}, which term applies?')
+    if len(text) < 20 or len(text) > MAX_QUESTION_LEN:
+        return None
+    return Question(
+        text=text, options=options, correct_index=correct_index,
+        kind="mcq", subtype="scenario",
+        explanation=_compose_explanation(sent.text, sent),
+        course=sent.course, filename=sent.filename, page=sent.page,
+    )
+
+
+def _build_comparison(sent: Segment, stats: TermStats, rng: random.Random) -> Question | None:
+    """Analyze: comparison question when the sentence contrasts two concepts."""
+    if not _COMPARISON_RE.search(sent.text):
+        return None
+    # Need at least two central terms in the sentence to ask about
+    terms = [t for t in stats.key_terms_in(sent.text) if t.lower() in sent.text.lower()]
+    if len(terms) < 2:
+        return None
+    # Pick the most central term as answer
+    answer = terms[0]
+    distractors = _distractors(answer, stats, rng, sent.page, source=sent.text)
+    if len(distractors) < 2:
+        return None
+    shape = _options_from(rng, answer, distractors)
+    if shape is None:
+        return None
+    options, correct_index = shape
+    # Build question: quote the comparison, ask which term is being described
+    # Use the clause before/after the comparison word as the stem
+    short = sent.text.strip()
+    if len(short) > 150:
+        short = short[:150].rsplit(" ", 1)[0] + "…"
+    text = _cap_question(f'According to the material: "{short}" — which term is primarily described?')
+    if len(text) > MAX_QUESTION_LEN:
+        text = _cap_question(f'Which term is primarily described in: "{short}"')
+    if len(text) > MAX_QUESTION_LEN or len(text) < 20:
+        return None
+    return Question(
+        text=text, options=options, correct_index=correct_index,
+        kind="mcq", subtype="comparison",
+        explanation=_compose_explanation(sent.text, sent),
+        course=sent.course, filename=sent.filename, page=sent.page,
+    )
+
+
+def _build_cause_effect(sent: Segment, stats: TermStats, rng: random.Random) -> Question | None:
+    """Analyze: cause → effect question.
+
+    Detects causal language and asks about the consequence / cause.
+    """
+    if not _CAUSE_RE.search(sent.text):
+        return None
+    definition = _find_definition(sent.text)
+    # Prefer sentences that are both definition + causal (richest)
+    key_term: str | None = None
+    if definition and stats.is_key(definition.term):
+        key_term = _ARTICLE_RE.sub("", definition.term).strip() or definition.term
+    else:
+        terms = [t for t in stats.key_terms_in(sent.text) if t.lower() in sent.text.lower()]
+        if terms:
+            key_term = terms[0]
+    if not key_term or not stats.is_key(key_term):
+        return None
+    distractors = _distractors(key_term, stats, rng, sent.page, source=sent.text)
+    if len(distractors) < 2:
+        return None
+    shape = _options_from(rng, key_term, distractors)
+    if shape is None:
+        return None
+    options, correct_index = shape
+    # Ask about the effect/cause using the causal clause
+    # Extract the part around the causal connector for a natural question
+    m = _CAUSE_RE.search(sent.text)
+    connector = m.group(0) if m else "causes"
+    # Simple framing that always fits
+    short = sent.text.strip()
+    if len(short) > 140:
+        short = short[:140].rsplit(" ", 1)[0] + "…"
+    text = _cap_question(f'What is the key concept in: "{short}"')
+    if len(text) > MAX_QUESTION_LEN or len(text) < 20:
+        return None
+    return Question(
+        text=text, options=options, correct_index=correct_index,
+        kind="mcq", subtype="cause_effect",
+        explanation=_compose_explanation(sent.text, sent),
+        course=sent.course, filename=sent.filename, page=sent.page,
+    )
+
+
 # --- Core generation ------------------------------------------------------
 
-_BUILDERS = (_build_def2term, _build_term2def, _build_number, _build_tf)
+_BUILDERS = (_build_def2term, _build_term2def, _build_number, _build_tf,
+             _build_scenario, _build_comparison, _build_cause_effect)
 
 
 def _quizworthy(sent: Segment, stats: TermStats) -> float:
     """How good a source this sentence is (0 = never build a question from it)."""
     definition = _find_definition(sent.text)
     has_number = _pick_number(sent) is not None
-    if definition is None and not has_number:
+    has_cause = bool(_CAUSE_RE.search(sent.text))
+    has_comparison = bool(_COMPARISON_RE.search(sent.text))
+    # Allow causal / comparison sentences even without a strict definition
+    if definition is None and not has_number and not has_cause and not has_comparison:
         return 0.0
 
     score = 0.0
@@ -1055,6 +1205,10 @@ def _quizworthy(sent: Segment, stats: TermStats) -> float:
         score += 6.0
     if has_number:
         score += 3.0
+    if has_cause:
+        score += 2.5
+    if has_comparison:
+        score += 2.0
     score += min(6.0, stats.value_of_text(sent.text))
     if sent.page is None:
         score -= 1.0
@@ -1288,13 +1442,27 @@ def generate_note(segments: list[Segment], seed: int | None = None) -> Note:
         text += "."
     definition = _find_definition(chosen.text)
     term = definition.term if definition is not None else None
+    # If no definition, infer a label from top key terms so render() can bold it
+    if term is None:
+        kts = TermStats.build(tagged).key_terms_in(chosen.text)
+        if kts:
+            term = kts[0]
+    detail = _supporting_sentence(chosen, term, tagged, rng)
+    # Build a compact 2nd detail as bullet variety when available (kept in detail
+    # field as "detail2" separator — rendered as second bullet)
+    extra = None
+    if detail:
+        used = {chosen.text, detail}
+        extra = _extra_bullet(chosen, term, tagged, used)
+        if extra and detail:
+            detail = detail + " § " + extra
     return Note(
         text=text,
         course=chosen.course,
         filename=chosen.filename,
         page=chosen.page,
         term=term,
-        detail=_supporting_sentence(chosen, term, tagged, rng),
+        detail=detail,
     )
 
 
@@ -1306,22 +1474,63 @@ def _supporting_sentence(
 ) -> str | None:
     """A second sentence about the same term, so a note is a study point.
 
-    Both sentences have to come from the material; the supporting one is only
-    used when it says something about the term without repeating the note.
+    Prefers sentences that add a *different* aspect: a causal explanation,
+    a comparison, or an example — not just another definition. Both sentences
+    come from the material; the supporting one is only used when it says
+    something about the term without repeating the note.
     """
     if not term:
         return None
     low = term.lower()
-    options = [
+    candidates = [
         s for s in tagged
         if s.text != chosen.text
         and low in s.text.lower()
         and len(_content_words(s.text)) >= _MIN_DEFINITION_CONTENT
     ]
-    if not options:
+    if not candidates:
         return None
-    rng.shuffle(options)
-    return options[0].text.strip()
+    # Rank: prefer causal / comparative / example sentences, then by length variety
+    def _support_score(seg: Segment) -> float:
+        score = 0.0
+        if _CAUSE_RE.search(seg.text):
+            score += 3.0
+        if _COMPARISON_RE.search(seg.text):
+            score += 2.0
+        if re.search(r"\b(e\.g\.|for example|such as|including)\b", seg.text, re.IGNORECASE):
+            score += 2.5
+        # Prefer sentences that are not too similar in length to chosen (variety)
+        len_diff = abs(len(seg.text) - len(chosen.text))
+        score += min(1.0, len_diff / 80.0)
+        return score
+    candidates.sort(key=_support_score, reverse=True)
+    # Pick from top-3 with shuffle for variety across days
+    top = candidates[:3]
+    rng.shuffle(top)
+    return top[0].text.strip()
+
+
+def _extra_bullet(
+    chosen: Segment,
+    term: str | None,
+    tagged: list[Segment],
+    used: set[str],
+) -> str | None:
+    """A third bullet for richer notes: a different facet of the same term."""
+    if not term:
+        return None
+    low = term.lower()
+    for seg in tagged:
+        if seg.text in used or seg.text == chosen.text:
+            continue
+        if low not in seg.text.lower():
+            continue
+        if len(_content_words(seg.text)) < _MIN_DEFINITION_CONTENT:
+            continue
+        if _is_junk(seg.text):
+            continue
+        return seg.text.strip()
+    return None
 
 
 # --- Question answering ----------------------------------------------------

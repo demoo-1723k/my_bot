@@ -1,3 +1,10 @@
 python-telegram-bot>=21.0
 pdfplumber>=0.11
 python-dotenv>=1.0
+httpx>=0.24
+# --- Optional AI upgrades (install any you need) ---
+# LLM providers: OpenAI / Groq use the OpenAI-compatible API via httpx (no extra dep)
+# For Gemini the same httpx path is used. No openai package required.
+# Dense retrieval & reranking (hybrid BM25 + semantic):
+#   pip install sentence-transformers
+# Local LLM (Ollama) needs no extra package — just set OLLAMA_HOST
