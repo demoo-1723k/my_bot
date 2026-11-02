@@ -1261,3 +1261,4 @@ C:\Users\kena\Desktop\this_Up\my_bot\bot.py:2862: PTBUserWarning: Tasks created 
 2026-11-02 10:34:22,208 - telegram.ext.Application - INFO - Application started
 2026-11-02 10:34:24,797 - llm_client - WARNING - Model 'qwen2.5:0.5b' is missing on https://ollama-server-6nsk.onrender.com — pulling it in the background (the next request will use it).
 2026-11-02 10:34:42,089 - llm_client - INFO - Model 'qwen2.5:0.5b' is ready on https://ollama-server-6nsk.onrender.com.
+2026-11-02 10:39:51,398 - __main__ - WARNING - Network error while handling an update: httpx.ReadError: 
