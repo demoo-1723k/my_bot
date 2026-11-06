@@ -1262,3 +1262,16 @@ C:\Users\kena\Desktop\this_Up\my_bot\bot.py:2862: PTBUserWarning: Tasks created 
 2026-11-02 10:34:24,797 - llm_client - WARNING - Model 'qwen2.5:0.5b' is missing on https://ollama-server-6nsk.onrender.com — pulling it in the background (the next request will use it).
 2026-11-02 10:34:42,089 - llm_client - INFO - Model 'qwen2.5:0.5b' is ready on https://ollama-server-6nsk.onrender.com.
 2026-11-02 10:39:51,398 - __main__ - WARNING - Network error while handling an update: httpx.ReadError: 
+2026-11-02 11:00:35,696 - __main__ - WARNING - Network error while handling an update: httpx.ReadError: 
+2026-11-02 11:00:47,465 - __main__ - WARNING - Network error while handling an update: httpx.ConnectError: [Errno 11001] getaddrinfo failed
+2026-11-02 11:00:48,987 - __main__ - WARNING - Network error while handling an update: httpx.ConnectError: [Errno 11001] getaddrinfo failed
+2026-11-02 11:00:51,268 - __main__ - WARNING - Network error while handling an update: httpx.ConnectError: [Errno 11001] getaddrinfo failed
+2026-11-02 11:00:55,037 - __main__ - WARNING - Network error while handling an update: httpx.ConnectError: [Errno 11001] getaddrinfo failed
+2026-11-02 11:01:00,117 - __main__ - WARNING - Network error while handling an update: httpx.ConnectError: [Errno 11001] getaddrinfo failed
+2026-11-02 11:01:07,785 - __main__ - WARNING - Network error while handling an update: httpx.ConnectError: [Errno 11001] getaddrinfo failed
+2026-11-02 11:01:19,418 - __main__ - WARNING - Network error while handling an update: httpx.ConnectError: [Errno 11001] getaddrinfo failed
+2026-11-02 11:30:15,569 - __main__ - WARNING - Network error while handling an update: httpx.ConnectError: [Errno 11001] getaddrinfo failed
+2026-11-02 11:30:41,626 - __main__ - WARNING - Network error while handling an update: httpx.ConnectError: [Errno 11001] getaddrinfo failed
+2026-11-02 11:31:12,020 - __main__ - WARNING - Network error while handling an update: httpx.ConnectError: [Errno 11001] getaddrinfo failed
+2026-11-02 11:31:42,034 - __main__ - WARNING - Network error while handling an update: httpx.ConnectError: [Errno 11001] getaddrinfo failed
+2026-11-02 11:32:12,693 - __main__ - WARNING - Network error while handling an update: httpx.ConnectError: [Errno 11001] getaddrinfo failed
